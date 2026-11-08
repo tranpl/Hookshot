@@ -86,9 +86,9 @@ bool create_instance() {
 #if defined(__APPLE__)
     // (macos) MoltenVK backs descriptor sets with Metal argument buffers, which the programs' aliased bindings need (vk_draw.cpp)
     setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
-    // (macos) a submission encoded into Metal on MoltenVK's own queue thread, not in vkQueueSubmit2 on the game's graphics thread,
-    // where it was close to half that thread's time: the next frame's replay runs while the last one is encoded
-    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+    // (macos, MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0 tried: encoding on MoltenVK's own thread took half the graphics thread's time off
+    // it, but an event the other queue waits for then stopped advancing (0x100d6c8048 stuck while its waits went on), and near the
+    // Deku Tree every queue went on only after hold_ms: 2 fps. MoltenVK's default, synchronous submits, until that is understood)
 #endif
     uint32_t version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&version);
