@@ -140,6 +140,10 @@ static int reserve_guest(void) {
        step: MAP_NORESERVE). Decommitting is madvise (host/posix/win32_posix.c VirtualFree): the pages read as zero. */
     void hos_commit_init(void);
     hos_commit_init();   /* (the crash report) */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0   /* (macos: the address as a hint, checked below; nothing else is mapped up there) */
+#endif
+#ifdef __linux__   /* (macos: no memfd or udmabuf; anonymous memory, imported by host pointer) */
     /* The window is a memfd's, shared, so the Vulkan back end can hand the GPU the game's own pages as a dma-buf
        (udmabuf, gpu/vk/vk_memory.cpp import_dma_buf) instead of a host pointer: amdgpu checks every page of a host-pointer
        import again at each command submission, 15-45 ms a submission in Kokiri Forest. Pages of a shared mapping are freed
@@ -184,13 +188,16 @@ static int reserve_guest(void) {
             hos_log("mem: no memfd for the guest window (errno %d): anonymous memory", errno);
         }
     }
+#endif
     if (mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) != (void *)A64_HOST_BASE)
         return 0;
     /* (issue 312) no transparent huge pages in the guest window: the renderer imports its pools as userptr memory, and every
        collapse khugepaged makes in them changes their mappings, which the kernel answers by pinning the pages again at the
        next submission: ~250 ms a submit on RADV while the GPU sat idle. HOS_THP=1: as before */
+#ifdef MADV_NOHUGEPAGE
     if (!getenv("HOS_THP")) madvise((void *)A64_HOST_BASE, GUEST_SPACE, MADV_NOHUGEPAGE);
+#endif
 #ifdef __linux__
     /* (HOS_NO_THP=1, experiment: none outside the window either. With THP "always" 400-450 MB of the host heap's and the binary's bss are huge
        pages, each resident whole when any of its 2 MB is touched) */
@@ -206,7 +213,21 @@ static int reserve_guest(void) {
 int hos_guest_memfd = -1;
 int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
 int hos_posix_guest_discard(void *p, size_t n) {
+#if defined(__APPLE__)
+    /* (macos) madvise promises no zeros here: whole 16 KB host pages mapped afresh, the 4 KB guest pages at the edges cleared */
+    const uintptr_t hp = (uintptr_t)sysconf(_SC_PAGESIZE), lo = (uintptr_t)p, hi = lo + n;
+    const uintptr_t a = (lo + hp - 1) & ~(hp - 1), b = hi & ~(hp - 1);
+    if (b > a) {
+        if (mmap((void *)a, b - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+        if (lo < a) memset((void *)lo, 0, a - lo);
+        if (hi > b) memset((void *)b, 0, hi - b);
+    } else {
+        memset(p, 0, n);
+    }
+    return 0;
+#else
     return madvise(p, n, hos_guest_memfd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
+#endif
 }
 #endif
 

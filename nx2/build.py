@@ -51,10 +51,13 @@ PGO = os.environ.get("RX_PGO", "")
 # against that root (the AppImage's: glibc 2.35, so the game runs on older systems than the one that built it).
 # HOOKSHOT_VK_PREBUILT=<hookshot_vk.so>: the Vulkan back end as built already (the AppImage's), not compiled here.
 LINUX = not toolchain.windows()   # (hookshot: RX_TARGET=windows on Linux builds the Windows game, with llvm-mingw)
+# (macos) macOS on Apple silicon takes the Linux path (host/posix, SDL2) with a Mach-O executable and hookshot_vk.dylib,
+# linked by Apple's ld64, the renderer on MoltenVK. LINUX stays true there: it means "the POSIX build"
+MAC = LINUX and sys.platform == "darwin"
 POSIX = os.path.join(kit.HERE, "..", "host", "posix")
 SYSROOT = os.environ.get("HOOKSHOT_SYSROOT", "")
 EXE = "hookshot" if LINUX else "hookshot.exe"
-VK_LIB = "hookshot_vk.so" if LINUX else "hookshot_vk.dll"
+VK_LIB = "hookshot_vk.dylib" if MAC else "hookshot_vk.so" if LINUX else "hookshot_vk.dll"
 
 
 def target():
@@ -83,12 +86,18 @@ def HOT_ORDER():
     p = os.path.join(kit.WORK, "hot_order.txt")
     if not os.path.exists(p) or os.environ.get("RX_NO_ORDER"):
         return []
+    if MAC:   # (ld64's order file wants the symbols' Mach-O names, with their leading underscore)
+        mo = p[:-4] + "_macho.txt"
+        if not os.path.exists(mo) or os.path.getmtime(mo) < os.path.getmtime(p):
+            with open(p) as f, open(mo, "w") as g:
+                g.writelines("_" + l.strip() + "\n" for l in f if l.strip())
+        return ["-Wl,-order_file," + mo]
     if LINUX:
         return ["-Wl,--symbol-ordering-file=" + p, "-Wl,--no-warn-symbol-ordering"]
     return [toolchain.link_opt("/order:@" + p.replace("\\", "/")), toolchain.link_opt("/ignore:4037")]
 
 
-HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
+HOST_LIBS = ["-lpthread", "-lm", "-framework", "CoreFoundation"] if MAC else ["-lpthread", "-ldl", "-lm"] if LINUX else \
     ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
 GPU = os.path.join(kit.HERE, "..", "gpu")
 # FFmpeg (libavcodec's VP8/VP9 decoders, swscale) for nn::codec's video decoders (host/nn_video.c): the static build
@@ -371,15 +380,18 @@ WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WR
 from host_cpu import host_march   # (make_game.py asks it too: the AppImage's renderer)
 
 MARCH = os.environ.get("RX_MARCH") or host_march()
-if MARCH != "x86-64-v3":
+if MARCH.startswith("x86-64") and MARCH != "x86-64-v3":
     print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
-CPU = ["-march=" + MARCH, "-ffp-contract=off"]
+# (macos) an arm64 host: -mcpu (apple-m1 runs on every Apple silicon Mac), and no -mcx16, which is x86's 16-byte CAS
+ARM64 = not MARCH.startswith("x86-64")
+CPU = (["-mcpu=" + MARCH] if ARM64 else ["-march=" + MARCH]) + ["-ffp-contract=off"]
+CX16 = [] if ARM64 else ["-mcx16"]
 
 
 def flags(gen, rt64, opt, polls):
     return target() + CPU + [
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
-        "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
+        "-fno-strict-aliasing"] + CX16 + ["-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000"] + \
         (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
 
@@ -608,7 +620,8 @@ def main():
             host_srcs = sorted(os.path.join(HOST, f) for f in os.listdir(HOST) if f.endswith(".c") and (f != "pgo_rt.c" or PGO == "gen")
                                and not (LINUX and f in ("display.c", "mf_av1.c", "rx_nowgpu.c")) and (f != "rx_nowgpu.c" or not have_wgpu))
             if LINUX:   # (the window on SDL2, the Win32 calls on POSIX, no Media Foundation and no WebGPU renderer)
-                host_srcs += [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c", "prof.c")]
+                # (macos: no prof.c, which is Linux's /proc and perf events; linux_stubs.c stands in)
+                host_srcs += [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c") + (() if MAC else ("prof.c",))]
         else:
             srcs += [os.path.join(NX2_RT, "eden_shim.c"), write_info(out)]
     if os.environ.get("RX_VK_ONLY"):   # (no lift needed: the back end alone)
@@ -643,7 +656,7 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0"] + CX16 + ["-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if LINUX:
@@ -797,8 +810,13 @@ def main():
         exe = os.path.join(out, EXE)   # (+ hookshot.map: crash offsets -> f_<guest address>)
         t = time.time()
         # (--export-dynamic-symbol: the window's state, which the Vulkan back end's own Win32 calls read by name)
-        r = subprocess.run([cc] + target() + ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections",
-                                              "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
+        # (macos: ld64. An executable's globals are visible to the dylibs it loads (dlsym), so hos_posix_* needs nothing)
+        # (-u: the window hooks hookshot_vk.dylib finds by name (dlsym) kept, which -dead_strip removed: nothing in the executable calls them)
+        hooks = ["-Wl,-u,_hos_posix_" + n for n in ("keys", "window", "post_message", "set_title")]
+        how = (["-o", exe, "-Wl,-map," + exe + ".map", "-Wl,-dead_strip", "-Wl,-no_warn_duplicate_libraries"] + hooks + ["@" + rsp] if MAC else
+               ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections",
+                "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp])
+        r = subprocess.run([cc] + target() + how + HOT_ORDER() +
                            (["-fprofile-instr-generate"] if PGO == "gen" else []) +
                            (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS,
                            capture_output=True, text=True)
@@ -863,7 +881,11 @@ def main():
         vrsp = os.path.join(out, "vk_objs.rsp")
         open(vrsp, "w", encoding="utf-8").write("\n".join('"%s"' % j[2].replace("\\", "/") for j in vk_jobs))
         t = time.time()
-        if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
+        if MAC:   # (the system's libc++; hos_posix_* found in the executable when it loads this)
+            link = [toolchain.need(toolchain.find("clang++"))] + target() + [
+                "-dynamiclib", "-o", vdll, "-Wl,-map," + vdll + ".map", "-Wl,-dead_strip", "-Wl,-undefined,dynamic_lookup",
+                "-install_name", "@rpath/" + VK_LIB, "@" + vrsp, "-lpthread", "-lm"]
+        elif LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + [
                 "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
                 "-static-libstdc++", "-static-libgcc", "@" + vrsp, "-ldl", "-lpthread", "-lm"]

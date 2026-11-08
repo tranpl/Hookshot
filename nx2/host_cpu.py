@@ -6,6 +6,9 @@ import os
 
 def host_march():
     want = ("avx2", "fma", "bmi2", "movbe")
+    import platform, sys
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return "apple-m1"   # (macOS on Apple silicon: build.py makes it -mcpu=, an arm64 CPU)
     try:
         if os.name == "nt":
             import ctypes

@@ -78,8 +78,38 @@ static volatile int renderer;   /* the renderer presents into the window */
 static HANDLE renderer_up;   /* (set once rx_start has returned, ready or not: hos_renderer_wait) */
 static int fullscreen;
 
+#if defined(__APPLE__)
+/* (macos) Cocoa's views belong to the main thread: the renderer's surface is made there (the window's loop below runs the
+   request), and the drawable's size is read there and kept for the renderer's thread */
+static struct { void *w, *instance, *surface; volatile int asked, done, ok; } surface_req;
+static volatile int drawable_w, drawable_h;
+static int create_surface(void *w, void *instance, void *surface) {
+    surface_req.w = w, surface_req.instance = instance, surface_req.surface = surface;
+    __atomic_store_n(&surface_req.done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&surface_req.asked, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&surface_req.done, __ATOMIC_ACQUIRE)) Sleep(1);
+    return surface_req.ok;
+}
+static void main_thread_work(void) {
+    if (__atomic_load_n(&surface_req.asked, __ATOMIC_ACQUIRE)) {
+        surface_req.asked = 0;
+        surface_req.ok = hos_sdl_vulkan_surface(surface_req.w, surface_req.instance, surface_req.surface);
+        __atomic_store_n(&surface_req.done, 1, __ATOMIC_RELEASE);
+    }
+}
+static void drawable_size(void *w, int *width, int *height) {
+    (void)w;
+    *width = __atomic_load_n(&drawable_w, __ATOMIC_ACQUIRE), *height = __atomic_load_n(&drawable_h, __ATOMIC_ACQUIRE);
+}
+static void drawable_refresh(void *w) {
+    int dw = 0, dh = 0;
+    hos_sdl_pixel_size(w, &dw, &dh);
+    __atomic_store_n(&drawable_w, dw, __ATOMIC_RELEASE), __atomic_store_n(&drawable_h, dh, __ATOMIC_RELEASE);
+}
+#else
 static int create_surface(void *w, void *instance, void *surface) { return hos_sdl_vulkan_surface(w, instance, surface); }
 static void drawable_size(void *w, int *width, int *height) { hos_sdl_pixel_size(w, width, height); }
+#endif
 static MkwVkWindow vk_window = {MKWVK_WINDOW_VERSION, create_surface, drawable_size, NULL};
 
 static void mouse_capture(int on) {
@@ -104,7 +134,7 @@ static DWORD WINAPI renderer_main(void *p) {
     renderer = ok;
     if (ok) {   /* (a size change while it started) */
         int w = 0, h = 0;
-        hos_sdl_pixel_size(window, &w, &h);
+        drawable_size(window, &w, &h);
         if (w > 0 && h > 0) rx_resize(w, h);
     }
     SetEvent(renderer_up);
@@ -119,6 +149,14 @@ void hos_renderer_wait(void) {
 }
 
 static volatile int start_asked;
+/* (the Vulkan back end's start, before the first frame: its shader preparation's progress in the title; NULL puts the title back.
+   Applied on this, the window's, thread) */
+static char pending_title[128];
+static volatile int title_asked;
+__attribute__((visibility("default"))) void hos_posix_set_title(const char *t) {
+    snprintf(pending_title, sizeof pending_title, "%s", t ? t : HOS_GAME_TITLE);
+    __atomic_store_n(&title_asked, 1, __ATOMIC_RELEASE);
+}
 static volatile int fullscreen_asked = -1;   /* (the Insert menu's row, from the renderer's thread: applied on this one) */
 
 /* PostMessageA to the window (host/posix/win32_posix.c): WM_APP + 7, the Insert menu's Fullscreen row (host/display.c's) */
@@ -139,12 +177,20 @@ int hos_display_init(void) {
     hos_sdl_identity("Hookshot", HOS_APP_ID);
     hos_sdl_hint("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
     hos_sdl_hint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+#if defined(__APPLE__)   /* (the same Vulkan loader as the renderer's, Homebrew's: dlopen does not look in its folder) */
+    if (!getenv("SDL_VULKAN_LIBRARY")) hos_sdl_hint("SDL_VULKAN_LIBRARY", "/opt/homebrew/lib/libvulkan.1.dylib");
+#endif
     /* (bundled SDL tries x11 before wayland. NVIDIA's X11 surface has no mailbox, and an immediate
        present then drops vblank for every output. Wayland has mailbox. SDL_VIDEODRIVER (SDL3: SDL_VIDEO_DRIVER) still wins.
        Under gamescope (XDG_CURRENT_DESKTOP names it: Steam Deck game mode) SDL keeps its own order.) */
     const char* desktop = getenv("XDG_CURRENT_DESKTOP");
     const int gamescope = desktop && strstr(desktop, "gamescope");
+#if defined(__APPLE__)   /* (macos: Cocoa, SDL's only driver there) */
+    (void)gamescope;
+    if (0)
+#else
     if (!getenv("SDL_VIDEODRIVER") && !getenv("SDL_VIDEO_DRIVER") && !gamescope)
+#endif
         hos_sdl_hint(hos_sdl_load() == 3 ? "SDL_VIDEO_DRIVER" : "SDL_VIDEODRIVER", "wayland,x11");
     if (!hos_sdl_init(HOS_SDL_VIDEO | HOS_SDL_EVENTS)) {
         hos_log("display: SDL_Init: %s: no window", hos_sdl_error());
@@ -197,8 +243,14 @@ void hos_display_loop(void) {
         hos_sdl_icon(window, png);
     }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
+#if defined(__APPLE__)
+    drawable_refresh(window);
+#endif
     CloseHandle(CreateThread(NULL, 0, renderer_main, NULL, 0, NULL));
     for (;;) {
+#if defined(__APPLE__)
+        main_thread_work();
+#endif
         hos_sdl_pads_pump();
         if (hos_sdl_wait_event(&e, 4)) {
             do {
@@ -211,6 +263,9 @@ void hos_display_loop(void) {
                 case HOS_SDL_EV_RESIZED:
                     if (renderer) {
                         int w = 0, h = 0;
+#if defined(__APPLE__)
+                        drawable_refresh(window);
+#endif
                         hos_sdl_pixel_size(window, &w, &h);
                         rx_resize(w, h);
                     }
@@ -247,6 +302,7 @@ void hos_display_loop(void) {
                 }
             } while (hos_sdl_poll_event(&e));
         }
+        if (__atomic_exchange_n(&title_asked, 0, __ATOMIC_ACQ_REL)) hos_sdl_title(window, pending_title);
         const int asked = __atomic_exchange_n(&fullscreen_asked, -1, __ATOMIC_ACQ_REL);
         if (asked >= 0) set_fullscreen(asked);
         keys_update();

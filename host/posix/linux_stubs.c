@@ -48,3 +48,10 @@ void rx_request_frame_dump(void) { hos_log("rx: frame dumps are the WebGPU rende
 void rx_set_screenshot_ms(int64_t ms) { (void)ms; hos_log("rx: !shots is the WebGPU renderer's: RX_VK_SHOTS instead"); }
 void rx_request_rdoc_capture(int frames) { (void)frames; }
 void rx_flash_dark_arm(void) {}
+
+#if defined(__APPLE__)
+/* (macos) host/posix/prof.c is Linux's (/proc, perf events): HOS_PROFILE and the watches are not in the Mac build */
+void hos_prof_start(void) {
+    if (getenv("HOS_PROFILE") || getenv("HOS_THREAD_TIMES")) hos_log("prof: HOS_PROFILE is not in the macOS build");
+}
+#endif

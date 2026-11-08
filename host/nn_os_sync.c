@@ -287,8 +287,12 @@ static void poke_multiwait(void) {
     WakeAllConditionVariable(&mw_cv);
 }
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)) && !defined(__EMSCRIPTEN__)
+#if defined(__aarch64__)   /* (arm64: the spin-wait hint) */
+#define _mm_pause() __asm__ __volatile__("yield")
+#else
 #include <emmintrin.h>
+#endif
 static int64_t spin_ns(void) {
     static int64_t ns = -1;
     if (ns < 0) {

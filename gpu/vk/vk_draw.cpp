@@ -591,7 +591,11 @@ void ensure_layout(Program& p) {
         add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, st.vk_stage, st.info.texture_descriptors);
         add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, st.vk_stage, st.info.image_descriptors);
     }
-    p.push = dev.push_descriptor && vkCmdPushDescriptorSetKHR && total <= dev.max_push_descriptors;
+    // (macos) MoltenVK puts a push descriptor set in Metal's own bindings, not an argument buffer, and cannot alias one binding with a
+    // descriptor array there ("not implemented through argument buffers"): the program's pipeline failed. On Apple GPUs (vendor 0x106b)
+    // the programs take ordinary descriptor sets, which MoltenVK backs with argument buffers. RX_VK_PUSH=1: push descriptors as elsewhere
+    static const bool apple_sets = dev.props.vendorID == 0x106b && !(getenv("RX_VK_PUSH") && atoi(getenv("RX_VK_PUSH")));
+    p.push = dev.push_descriptor && vkCmdPushDescriptorSetKHR && total <= dev.max_push_descriptors && !apple_sets;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     if (p.push) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = (uint32_t)bindings.size();

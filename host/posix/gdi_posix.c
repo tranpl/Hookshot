@@ -56,12 +56,14 @@ static void faces_load(void) {
                                     "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
                                     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
                                     "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-                                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"};
+                                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                                    "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial Unicode.ttf"};   /* (macos) */
     static const char *bold[] = {"/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                                  "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf",
                                  "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
                                  "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-                                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"};
+                                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                                 "/System/Library/Fonts/Supplemental/Arial Bold.ttf"};   /* (macos) */
     char path[4096];
     /* (a font beside the game first: fonts/regular.ttf, fonts/bold.ttf) */
     GetModuleFileNameA(NULL, path, sizeof path);

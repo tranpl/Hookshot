@@ -98,7 +98,12 @@ typedef struct { LONG cx, cy; } SIZE;
 #define _mkdir(p) mkdir((p), 0755)
 #define _getpid getpid
 #define _countof(a) (sizeof(a) / sizeof((a)[0]))
+#if defined(__APPLE__)   /* (macos declares no environ: a shared library reads it through _NSGetEnviron) */
+#include <crt_externs.h>
+#define _environ (*_NSGetEnviron())
+#else
 #define _environ environ
+#endif
 #define _fileno fileno
 #define _chsize_s(fd, size) ftruncate((fd), (off_t)(size))
 #define _atoi64 atoll
@@ -148,7 +153,11 @@ void SetLastError(DWORD e);
 #define InterlockedCompareExchangePointer InterlockedCompareExchange
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define _ReadWriteBarrier() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#if defined(__aarch64__)
+#define YieldProcessor() __asm__ __volatile__("yield")   /* (arm64: the spin-wait hint) */
+#else
 #define YieldProcessor() __builtin_ia32_pause()
+#endif
 
 /* ---- locks: SRW locks are POSIX rwlocks (zero-initialised is valid, as on Windows); condition variables a futex
    word, so they wait with either an SRW lock or a critical section ---- */

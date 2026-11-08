@@ -820,7 +820,11 @@ uint64_t cap_spare_max() {
 }
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     std::lock_guard lk(cap_free_mu);
-    if (cap_free.size() < 12 && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
+    // (macos) on MoltenVK a new capture buffer is a dedicated allocation and a GPU residency commit, a kernel call of milliseconds:
+    // with up to 24 captures alive and 12 kept, the game's thread made and freed them every submit, half its time near the Deku
+    // Tree. On Apple GPUs enough are kept for them to come round again
+    static const size_t keep = dev.props.vendorID == 0x106b ? 48 : 12;
+    if (cap_free.size() < keep && size <= (64ull << 20) && cap_free_bytes + size <= cap_spare_max()) {
         cap_free.push_back({buffer, alloc, map, size});
         cap_free_bytes += size;
     } else {

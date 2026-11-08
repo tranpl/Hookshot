@@ -1,6 +1,9 @@
 // The Vulkan back end's start: vulkan-1.dll, the instance, the device (Vulkan 1.3 and the extensions the NVN replay
 // wants where the GPU has them: mesh shaders, host memory import, graphics pipeline libraries), the window's
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "vk_paths.h"
 #include "vk_loader.h"
 
@@ -80,6 +83,13 @@ bool has_extension(const std::vector<VkExtensionProperties>& all, const char* na
 }
 
 bool create_instance() {
+#if defined(__APPLE__)
+    // (macos) MoltenVK backs descriptor sets with Metal argument buffers, which the programs' aliased bindings need (vk_draw.cpp)
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+    // (macos) a submission encoded into Metal on MoltenVK's own queue thread, not in vkQueueSubmit2 on the game's graphics thread,
+    // where it was close to half that thread's time: the next frame's replay runs while the last one is encoded
+    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+#endif
     uint32_t version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&version);
     if (version < VK_API_VERSION_1_3) {
@@ -91,15 +101,18 @@ bool create_instance() {
     const uint32_t n_exts = 2;
 #else
     // (linux: every window system's surface the loader has, for whichever one SDL's window is on: X11 or Wayland)
-    const char* exts[4] = {VK_KHR_SURFACE_EXTENSION_NAME};
+    // (macos: the window is a Metal layer, and MoltenVK is a portability driver the loader lists only when asked)
+    const char* exts[8] = {VK_KHR_SURFACE_EXTENSION_NAME};
     uint32_t n_exts = 1;
+    bool portability = false;
     {
         uint32_t n = 0;
         vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
-        for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"})
+        for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface", "VK_EXT_metal_surface"})
             if (has_extension(all, want)) exts[n_exts++] = want;
+        if (has_extension(all, "VK_KHR_portability_enumeration")) exts[n_exts++] = "VK_KHR_portability_enumeration", portability = true;
     }
 #endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -109,6 +122,9 @@ bool create_instance() {
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = n_exts;
     ci.ppEnabledExtensionNames = exts;
+#ifndef _WIN32
+    if (portability) ci.flags |= 0x00000001;   // (VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR)
+#endif
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
@@ -228,6 +244,10 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    // (macos) MoltenVK: a portability driver, which must be told the device is used as one (the spec requires the extension
+    // enabled when the device has it); its features are queried and enabled as they are
+    bool portability_subset = false;
+    optional("VK_KHR_portability_subset", portability_subset);
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -278,6 +298,10 @@ bool create_device() {
     if (dev.view_2d_of_3d) *tail = &v2d3d, tail = &v2d3d.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+#ifdef VK_ENABLE_BETA_EXTENSIONS
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+    if (portability_subset) *tail = &subset, tail = &subset.pNext;
+#endif
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
@@ -549,6 +573,21 @@ bool started_up() {
         const auto progress = [](size_t done, size_t total) {
             static bool tried = false;
             if (!total) return;
+#ifndef _WIN32
+            // (linux, macos: no console to give; the window's title says it, through the executable's display_sdl.c)
+            {
+                typedef void (*TitleFn)(const char*);
+                static TitleFn title = (TitleFn)dlsym(RTLD_DEFAULT, "hos_posix_set_title");
+                static size_t last_pct = ~(size_t)0;
+                const size_t pct = done * 100 / total;
+                if (title && pct != last_pct) {
+                    last_pct = pct;
+                    char t[96];
+                    snprintf(t, sizeof t, "Hookshot - Preparing shaders: %zu of %zu (%zu%%), first start only", done, total, pct);
+                    title(done >= total ? nullptr : t);
+                }
+            }
+#endif
             if (!tried) {
                 tried = true;
                 if (AllocConsole()) {
@@ -577,6 +616,10 @@ bool started_up() {
         prepare_run(progress);
         precompile_run(progress);
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
+#ifndef _WIN32
+        // (the title back to the game's own once the work is done: the last progress call can come before the last item ends)
+        if (auto title = (void (*)(const char*))dlsym(RTLD_DEFAULT, "hos_posix_set_title")) title(nullptr);
+#endif
     }
     return true;
 }

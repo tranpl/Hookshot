@@ -1857,8 +1857,12 @@ std::unique_ptr<Program> seed_program(size_t i, int inputs) {
     p->key = key;
     p->compute = by_stage[5] != nullptr;
     p->mesh = by_stage[7] != nullptr;
-    if (p->mesh)
+    if (p->mesh) {
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, no_types);
+        // (as the draw path's translation does: on a GPU without mesh shaders the program is a fallback one, compute and vertex
+        // stages in an ordinary graphics pipeline. Left as mesh, its pipeline had no vertex input state, which MoltenVK reads: a crash)
+        if (p->fallback) p->mesh = false;
+    }
     else if (p->compute)
         translate_into(*p, *blank, nullptr, nullptr, &code[5], no_types);
     else

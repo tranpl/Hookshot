@@ -9,12 +9,39 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <limits.h>
-#include <linux/futex.h>
 #include <signal.h>
 #include <sys/resource.h>
-#include <sys/syscall.h>
 #include <sys/time.h>
+#if defined(__APPLE__)
+/* (macos) futexes are os_sync_wait_on_address (macOS 14.4), thread ids pthread_threadid_np, the process map
+   mach_vm_region, the executable's path _NSGetExecutablePath; fibers switch with a few lines of arm64 assembly */
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <os/os_sync_wait_on_address.h>
+#include <sys/sysctl.h>
+#include <sys/ucontext.h>
+#else
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
+#endif
+
+/* the host's page: 16 KB on Apple silicon, where 4 KB guest pages share one */
+static uintptr_t host_page(void) {
+    static uintptr_t p;
+    if (!p) p = (uintptr_t)sysconf(_SC_PAGESIZE);
+    return p;
+}
+static pid_t own_tid(void) {
+#if defined(__APPLE__)
+    uint64_t id = 0;
+    pthread_threadid_np(NULL, &id);
+    return (pid_t)id;
+#else
+    return (pid_t)syscall(SYS_gettid);
+#endif
+}
 
 /* the guest window (third_party/a64-kit/rt/a64.h A64_HOST_BASE, host/hos.h HOS_GUEST_SPACE): one mapping, all of it
    readable and writable, which VirtualQuery reports as committed without asking the kernel */
@@ -50,9 +77,14 @@ static int64_t now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
+#if defined(__APPLE__)   /* (no pthread_condattr_setclock: timed waits are on the realtime clock) */
+#define COND_CLOCK CLOCK_REALTIME
+#else
+#define COND_CLOCK CLOCK_MONOTONIC
+#endif
 static struct timespec abs_after_ms(DWORD ms) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(COND_CLOCK, &ts);
     ts.tv_sec += ms / 1000;
     ts.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) ts.tv_sec++, ts.tv_nsec -= 1000000000L;
@@ -61,7 +93,9 @@ static struct timespec abs_after_ms(DWORD ms) {
 static void monitor_init(pthread_mutex_t *mu, pthread_cond_t *cv) {
     pthread_condattr_t a;
     pthread_condattr_init(&a);
+#if !defined(__APPLE__)
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
     pthread_cond_init(cv, &a);
     pthread_condattr_destroy(&a);
     pthread_mutex_init(mu, NULL);
@@ -78,9 +112,26 @@ static void monitor_init(pthread_mutex_t *mu, pthread_cond_t *cv) {
     } while (0)
 
 /* ---- futexes: condition variables, WaitOnAddress ---- */
+#if defined(__APPLE__)
+#define FUTEX_WAIT_PRIVATE 0
+#define FUTEX_WAKE_PRIVATE 1
+static long futex(volatile uint32_t *a, int op, uint32_t v, const struct timespec *ts) {
+    if (op == FUTEX_WAKE_PRIVATE) {
+        const int r = v == 1 ? os_sync_wake_by_address_any((void *)a, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE)
+                             : os_sync_wake_by_address_all((void *)a, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE);
+        return r < 0 && errno == ENOENT ? 0 : r;   /* (nobody waiting) */
+    }
+    if (!ts) { os_sync_wait_on_address((void *)a, v, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE); return 0; }   /* (a spurious wake is allowed) */
+    const uint64_t ns = (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+    if (!ns) { errno = ETIMEDOUT; return *a == v ? -1 : 0; }
+    const int r = os_sync_wait_on_address_with_timeout((void *)a, v, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
+    return r < 0 && errno == ETIMEDOUT ? -1 : 0;
+}
+#else
 static long futex(volatile uint32_t *a, int op, uint32_t v, const struct timespec *ts) {
     return syscall(SYS_futex, a, op, v, ts, NULL, 0);
 }
+#endif
 static struct timespec rel_ms(DWORD ms) {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     return ts;
@@ -195,7 +246,7 @@ static HThread *thread_self(void) {
     if (!self_thread) {   /* (a thread this file did not start: the main thread, a library's) */
         HThread *t = thread_new();
         t->th = pthread_self();
-        t->tid = (pid_t)syscall(SYS_gettid);
+        t->tid = own_tid();
         t->refs = 1;   /* (kept for the thread's life) */
         self_thread = t;
     }
@@ -219,7 +270,7 @@ static void thread_finish(DWORD code) {
 static void *thread_entry(void *p) {
     HThread *t = (HThread *)p;
     self_thread = t;
-    t->tid = (pid_t)syscall(SYS_gettid);
+    t->tid = own_tid();
     thread_finish(t->fn(t->arg));
     return NULL;
 }
@@ -274,13 +325,31 @@ BOOL SetThreadPriority(HANDLE h, int p) {
     if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
     t->priority = p;
     const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
+#if defined(__APPLE__)   /* (a thread id is not a process id here: only the calling thread lowers its own) */
+    if (nice && pthread_equal(t->th, pthread_self())) setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG);
+#else
     if (nice && t->tid) setpriority(PRIO_PROCESS, (id_t)t->tid, nice);
+#endif
     return TRUE;
 }
 int GetThreadPriority(HANDLE h) {
     HThread *t = thread_of(h);
     return t ? t->priority : 0;
 }
+#if defined(__APPLE__)   /* (macos: no processor affinity; every processor, as the process's mask) */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
+    if (!thread_of(h) || !mask) { last_error = ERROR_INVALID_PARAMETER; return 0; }
+    DWORD_PTR proc, sys;
+    GetProcessAffinityMask(NULL, &proc, &sys);
+    return proc;
+}
+BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
+    (void)p;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    *proc = *sys = n >= 64 ? ~(DWORD_PTR)0 : (((DWORD_PTR)1 << n) - 1);
+    return TRUE;
+}
+#else
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
     HThread *t = thread_of(h);
     if (!t || !mask) { last_error = ERROR_INVALID_PARAMETER; return 0; }
@@ -306,6 +375,7 @@ BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     *sys = n >= 64 ? ~(DWORD_PTR)0 : (((DWORD_PTR)1 << n) - 1);
     return TRUE;
 }
+#endif
 int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR w, int n, LPSTR s, int cap, LPCSTR def, BOOL *used) {
     (void)cp, (void)flags, (void)def;
     if (used) *used = FALSE;
@@ -354,7 +424,11 @@ HRESULT SetThreadDescription(HANDLE h, PCWSTR name) {
     t->name[sizeof t->name - 1] = 0;
     char shortname[16];
     snprintf(shortname, sizeof shortname, "%s", t->name);   /* (the kernel keeps 15 characters) */
+#if defined(__APPLE__)   /* (macos names only the calling thread) */
+    if (t == self_thread || pthread_equal(t->th, pthread_self())) pthread_setname_np(t->name);
+#else
     pthread_setname_np(t->th, shortname);
+#endif
     return S_OK;
 }
 HRESULT GetThreadDescription(HANDLE h, PWSTR *name) {
@@ -372,9 +446,20 @@ static void filetime_ns(FILETIME *ft, int64_t ns) {
 }
 BOOL GetThreadTimes(HANDLE h, FILETIME *create, FILETIME *exit_, FILETIME *kernel, FILETIME *user) {
     HThread *t = thread_of(h);
-    clockid_t clk;
     struct timespec ts;
+#if defined(__APPLE__)
+    thread_basic_info_data_t bi;
+    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+    if (!t || t->done || thread_info(pthread_mach_thread_np(t->th), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS) {
+        last_error = ERROR_INVALID_HANDLE;
+        return FALSE;
+    }
+    ts.tv_sec = bi.user_time.seconds + bi.system_time.seconds;
+    ts.tv_nsec = (long)(bi.user_time.microseconds + bi.system_time.microseconds) * 1000L;
+#else
+    clockid_t clk;
     if (!t || t->done || pthread_getcpuclockid(t->th, &clk) || clock_gettime(clk, &ts)) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+#endif
     filetime_ns(create, 0), filetime_ns(exit_, 0), filetime_ns(kernel, 0);
     filetime_ns(user, (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     return TRUE;
@@ -477,8 +562,15 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
         pthread_mutex_unlock(&t->mu);
     } else if (is(h, H_TIMER)) {
         const int64_t due = ((HTimer *)h)->due;
+#if defined(__APPLE__)   /* (no clock_nanosleep: relative sleeps to the deadline) */
+        for (int64_t left; (left = due - now_ns()) > 0;) {
+            struct timespec ts = {(time_t)(left / 1000000000LL), (long)(left % 1000000000LL)};
+            nanosleep(&ts, NULL);
+        }
+#else
         struct timespec ts = {(time_t)(due / 1000000000LL), (long)(due % 1000000000LL)};
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+#endif
         r = WAIT_OBJECT_0;
     } else {
         last_error = ERROR_INVALID_HANDLE;
@@ -502,8 +594,26 @@ DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
 }
 
 /* ---- fibers ---- */
+#if defined(__APPLE__) && defined(__aarch64__)
+/* (macos) the switch itself: the callee-saved registers (x19-x30, d8-d15) and sp kept in the fiber, as the AAPCS64 asks.
+   ucontext's makecontext is deprecated here and does not run on arm64 */
+typedef struct { uint64_t x[13], sp, d[8]; } FiberRegs;   /* x19..x30 (x30 = lr: where it resumes), x29 fp */
+__attribute__((naked)) static void fiber_swap(FiberRegs *from, const FiberRegs *to) {
+    __asm__ volatile(
+        "stp x19, x20, [x0, #0]\n stp x21, x22, [x0, #16]\n stp x23, x24, [x0, #32]\n stp x25, x26, [x0, #48]\n"
+        "stp x27, x28, [x0, #64]\n stp x29, x30, [x0, #80]\n mov x9, sp\n str x9, [x0, #104]\n"
+        "stp d8, d9, [x0, #112]\n stp d10, d11, [x0, #128]\n stp d12, d13, [x0, #144]\n stp d14, d15, [x0, #160]\n"
+        "ldp x19, x20, [x1, #0]\n ldp x21, x22, [x1, #16]\n ldp x23, x24, [x1, #32]\n ldp x25, x26, [x1, #48]\n"
+        "ldp x27, x28, [x1, #64]\n ldp x29, x30, [x1, #80]\n ldr x9, [x1, #104]\n mov sp, x9\n"
+        "ldp d8, d9, [x1, #112]\n ldp d10, d11, [x1, #128]\n ldp d12, d13, [x1, #144]\n ldp d14, d15, [x1, #160]\n"
+        "mov x0, x19\n ret\n");   /* (x0 = x19: a new fiber's first run gets its Fiber in x0) */
+}
+#define FIBER_CTX FiberRegs uc
+#else
+#define FIBER_CTX ucontext_t uc
+#endif
 typedef struct {
-    ucontext_t uc;
+    FIBER_CTX;
     void *param, *stack;
     size_t stack_size;
     LPFIBER_START_ROUTINE fn;
@@ -524,8 +634,13 @@ BOOL ConvertFiberToThread(void) {
     cur_fiber = NULL;
     return TRUE;
 }
+#if defined(__APPLE__) && defined(__aarch64__)
+static void fiber_start(void *p) {
+    Fiber *f = (Fiber *)p;
+#else
 static void fiber_start(unsigned lo, unsigned hi) {
     Fiber *f = (Fiber *)(uintptr_t)((uint64_t)hi << 32 | lo);
+#endif
     f->fn(f->param);
     ExitThread(0);   /* (a fiber function that returns ends its thread, as on Windows) */
 }
@@ -534,17 +649,26 @@ void *CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_RO
     size_t size = reserve > commit ? reserve : commit;
     if (size < (1u << 20)) size = 1u << 20;
     size = (size + 0xFFFF) & ~(size_t)0xFFFF;
+#ifndef MAP_STACK
+#define MAP_STACK 0
+#endif
     void *stack = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     if (stack == MAP_FAILED) { last_error = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
-    mprotect(stack, 4096, PROT_NONE);   /* (a guard page at the bottom) */
+    mprotect(stack, host_page(), PROT_NONE);   /* (a guard page at the bottom) */
     Fiber *f = (Fiber *)calloc(1, sizeof *f);
     f->param = param, f->fn = fn, f->stack = stack, f->stack_size = size;
+#if defined(__APPLE__) && defined(__aarch64__)
+    f->uc.sp = ((uint64_t)(uintptr_t)stack + size) & ~(uint64_t)15;
+    f->uc.x[0] = (uint64_t)(uintptr_t)f;              /* x19: the Fiber, handed to fiber_start in x0 */
+    f->uc.x[11] = (uint64_t)(uintptr_t)fiber_start;   /* x30: the first switch returns into it */
+#else
     getcontext(&f->uc);
     f->uc.uc_stack.ss_sp = stack;
     f->uc.uc_stack.ss_size = size;
     f->uc.uc_link = NULL;
     const uint64_t p = (uint64_t)(uintptr_t)f;
     makecontext(&f->uc, (void (*)(void))fiber_start, 2, (unsigned)p, (unsigned)(p >> 32));
+#endif
     return f;
 }
 void *CreateFiber(SIZE_T stack, LPFIBER_START_ROUTINE fn, void *param) { return CreateFiberEx(stack, stack, 0, fn, param); }
@@ -552,7 +676,11 @@ void SwitchToFiber(void *to) {
     Fiber *from = cur_fiber;
     if (!from || from == to) return;
     cur_fiber = (Fiber *)to;
+#if defined(__APPLE__) && defined(__aarch64__)
+    fiber_swap(&from->uc, &((Fiber *)to)->uc);
+#else
     swapcontext(&from->uc, &((Fiber *)to)->uc);
+#endif
 }
 void DeleteFiber(void *p) {
     Fiber *f = (Fiber *)p;
@@ -641,8 +769,26 @@ static int discard_pages(void *p, size_t n) {
     if (fn && (uintptr_t)p >= GUEST_LO && (uintptr_t)p + n <= GUEST_HI) return fn(p, n);
     return madvise(p, n, MADV_DONTNEED);
 }
+#if defined(__APPLE__)
+/* (macos) decommitted memory reads as zero again: madvise does not promise it here, so the whole host pages are mapped
+   afresh and the 4 KB guest pages at the edges of a 16 KB host page are cleared in place */
+static int zero_range(uintptr_t lo, uintptr_t hi, int prot) {
+    const uintptr_t hp = host_page(), a = (lo + hp - 1) & ~(hp - 1), b = hi & ~(hp - 1);
+    if (b > a) {
+        if (mmap((void *)a, b - a, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+        if (lo < a) memset((void *)lo, 0, a - lo);
+        if (hi > b) memset((void *)b, 0, hi - b);
+    } else if (prot & PROT_WRITE) {
+        memset((void *)lo, 0, hi - lo);
+    }
+    return 0;
+}
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0   /* (macos: a hint, checked below) */
+#endif
+#endif
 void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
-    const uintptr_t page = 4096;
+    const uintptr_t page = host_page();
     if (type & MEM_RESET) {   /* (the contents are not wanted any more: they read as zero after this) */
         const uintptr_t lo = ((uintptr_t)addr + page - 1) & ~(page - 1), hi = ((uintptr_t)addr + size) & ~(page - 1);
         if (hi > lo) discard_pages((void *)lo, hi - lo);
@@ -670,6 +816,10 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
 }
 BOOL VirtualFree(void *addr, SIZE_T size, DWORD type) {
     if (type & MEM_DECOMMIT) {   /* (kept mapped: decommitted memory reads as zero when touched again) */
+#if defined(__APPLE__)
+        const uintptr_t zlo = (uintptr_t)addr & ~(uintptr_t)4095, zhi = ((uintptr_t)addr + size + 4095) & ~(uintptr_t)4095;
+        return zero_range(zlo, zhi, PROT_READ | PROT_WRITE) == 0 ? TRUE : fail_errno();
+#endif
         const uintptr_t lo = (uintptr_t)addr & ~(uintptr_t)4095, hi = ((uintptr_t)addr + size + 4095) & ~(uintptr_t)4095;
         return discard_pages((void *)lo, hi - lo) == 0 ? TRUE : fail_errno();
     }
@@ -689,7 +839,8 @@ BOOL VirtualFree(void *addr, SIZE_T size, DWORD type) {
     return FALSE;
 }
 BOOL VirtualProtect(void *addr, SIZE_T size, DWORD protect, DWORD *old) {
-    const uintptr_t lo = (uintptr_t)addr & ~(uintptr_t)4095, hi = ((uintptr_t)addr + size + 4095) & ~(uintptr_t)4095;
+    const uintptr_t hp = host_page() - 1;   /* (the whole host pages: 16 KB on Apple silicon) */
+    const uintptr_t lo = (uintptr_t)addr & ~hp, hi = ((uintptr_t)addr + size + hp) & ~hp;
     if (old) *old = PAGE_READWRITE;
     return mprotect((void *)lo, hi - lo, prot_of(protect)) == 0 ? TRUE : fail_errno();
 }
@@ -705,6 +856,30 @@ SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T size
         return sizeof *mbi;
     }
     /* (anything else: the kernel's map of the process) */
+#if defined(__APPLE__)
+    {
+        mach_vm_address_t at = (mach_vm_address_t)page;
+        mach_vm_size_t len = 0;
+        vm_region_basic_info_data_64_t bi;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        mbi->State = MEM_FREE, mbi->Protect = PAGE_NOACCESS, mbi->RegionSize = host_page();
+        if (mach_vm_region(mach_task_self(), &at, &len, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS)
+            return sizeof *mbi;
+        if (at > page) {   /* (free up to the next region) */
+            mbi->RegionSize = (SIZE_T)(at - page);
+            return sizeof *mbi;
+        }
+        mbi->AllocationBase = (void *)(uintptr_t)at;
+        mbi->RegionSize = (SIZE_T)(at + len - page);
+        const int r = bi.protection & VM_PROT_READ, w = bi.protection & VM_PROT_WRITE, x = bi.protection & VM_PROT_EXECUTE;
+        mbi->State = r || w || x ? MEM_COMMIT : MEM_RESERVE;
+        mbi->Protect = mbi->AllocationProtect = !r ? PAGE_NOACCESS : x ? (w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ)
+                                                                       : (w ? PAGE_READWRITE : PAGE_READONLY);
+        mbi->Type = 0x20000;
+        return sizeof *mbi;
+    }
+#endif
     FILE *f = fopen("/proc/self/maps", "r");
     char line[512];
     uintptr_t prev_end = 0;
@@ -734,14 +909,26 @@ SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T size
 
 /* ---- modules ---- */
 static void exe_path(char *out, size_t cap) {
+#if defined(__APPLE__)
+    char raw[PATH_MAX];
+    uint32_t n = sizeof raw;
+    out[0] = 0;
+    if (_NSGetExecutablePath(raw, &n) == 0 && !realpath(raw, out)) snprintf(out, cap, "%s", raw);
+#else
     const ssize_t n = readlink("/proc/self/exe", out, cap - 1);
     out[n > 0 ? n : 0] = 0;
+#endif
 }
 /* a Windows library name, as the Linux one: SDL3.dll -> libSDL3.so.0, SDL2.dll -> libSDL2-2.0.so.0,
    vulkan-1.dll -> libvulkan.so.1, x.dll -> x.so */
 static const char *linux_name(const char *base) {
+#if defined(__APPLE__)   /* (Homebrew's SDL3 and sdl2-compat, and the Vulkan loader that finds MoltenVK) */
+    static const char *map[][2] = {{"sdl3.dll", "libSDL3.0.dylib"}, {"sdl2.dll", "libSDL2-2.0.0.dylib"},
+                                   {"vulkan-1.dll", "libvulkan.1.dylib"}};
+#else
     static const char *map[][2] = {{"sdl3.dll", "libSDL3.so.0"}, {"sdl2.dll", "libSDL2-2.0.so.0"},
                                    {"vulkan-1.dll", "libvulkan.so.1"}};
+#endif
     for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
         if (!strcasecmp(base, map[i][0])) return map[i][1];
     return NULL;
@@ -760,10 +947,24 @@ HMODULE LoadLibraryA(LPCSTR name) {
         const size_t n = strlen(path);
         if (n > 4 && !strcasecmp(path + n - 4, ".dll")) {
             if (!slash) return NULL;   /* (a Windows system library: kernel32, xinput, imm32 ...) */
+#if defined(__APPLE__)
+            strcpy(path + n - 4, ".dylib");
+#else
             strcpy(path + n - 4, ".so");
+#endif
         }
     }
     HMODULE m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#if defined(__APPLE__)   /* (a bare name: dlopen does not look in Homebrew's folder by itself) */
+    if (!m && !strchr(path, '/')) {
+        static const char *dirs[] = {"/opt/homebrew/lib/", "/usr/local/lib/"};
+        char full[PATH_MAX];
+        for (size_t i = 0; i < 2 && !m; i++) {
+            snprintf(full, sizeof full, "%s%s", dirs[i], path);
+            m = dlopen(full, RTLD_NOW | RTLD_LOCAL);
+        }
+    }
+#endif
     if (!m) last_error = ERROR_FILE_NOT_FOUND;
     return m;
 }
@@ -798,8 +999,10 @@ DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD cap) {
             snprintf(path, sizeof path, "%s", di.dli_fname);
         if (!path[0]) exe_path(path, sizeof path);
     } else {
+#if !defined(__APPLE__)   /* (macos: no dlinfo; a LoadLibraryA handle gives no name) */
         void *lm = NULL;   /* (a handle from LoadLibraryA) */
         if (dlinfo(m, RTLD_DI_LINKMAP, &lm) == 0 && lm) snprintf(path, sizeof path, "%s", ((const char **)lm)[1]);
+#endif
     }
     if (!cap) return 0;
     const size_t n = strlen(path);
@@ -921,7 +1124,11 @@ BOOL SetEndOfFile(HANDLE h) {
 }
 BOOL FlushFileBuffers(HANDLE h) {
     if (!is(h, H_FILE)) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
+#if defined(__APPLE__)
+    return fsync(((HFile *)h)->fd) == 0 || errno == EINVAL ? TRUE : fail_errno();
+#else
     return fdatasync(((HFile *)h)->fd) == 0 || errno == EINVAL ? TRUE : fail_errno();
+#endif
 }
 DWORD GetFileType(HANDLE h) {
     struct stat st;
@@ -1081,6 +1288,28 @@ static LPTOP_LEVEL_EXCEPTION_FILTER unhandled;
 static struct sigaction previous[32];
 static pthread_mutex_t handlers_mu = PTHREAD_MUTEX_INITIALIZER;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* (macos arm64) CONTEXT is x86-64's: x0-x15 stand in Rax..R15 in that order, pc in Rip, sp in Rsp, fp in Rbp */
+static void context_from(CONTEXT *c, const ucontext_t *uc) {
+    const struct __darwin_arm_thread_state64 *g = &uc->uc_mcontext->__ss;
+    DWORD64 *r[] = {&c->Rax, &c->Rcx, &c->Rdx, &c->Rbx, &c->Rsp, &c->Rbp, &c->Rsi, &c->Rdi,
+                    &c->R8, &c->R9, &c->R10, &c->R11, &c->R12, &c->R13, &c->R14, &c->R15};
+    for (int i = 0; i < 16; i++) *r[i] = g->__x[i];
+    c->Rsp = (DWORD64)__darwin_arm_thread_state64_get_sp(*g), c->Rbp = (DWORD64)__darwin_arm_thread_state64_get_fp(*g);
+    c->Rip = (DWORD64)__darwin_arm_thread_state64_get_pc(*g), c->EFlags = g->__cpsr, c->ContextFlags = CONTEXT_FULL;
+}
+static void context_to(ucontext_t *uc, const CONTEXT *c) {
+    struct __darwin_arm_thread_state64 *g = &uc->uc_mcontext->__ss;
+    const DWORD64 *r[] = {&c->Rax, &c->Rcx, &c->Rdx, &c->Rbx, NULL, NULL, &c->Rsi, &c->Rdi,
+                          &c->R8, &c->R9, &c->R10, &c->R11, &c->R12, &c->R13, &c->R14, &c->R15};
+    for (int i = 0; i < 16; i++) if (r[i]) g->__x[i] = *r[i];
+    __darwin_arm_thread_state64_set_sp(*g, c->Rsp);
+    __darwin_arm_thread_state64_set_fp(*g, c->Rbp);
+    __darwin_arm_thread_state64_set_pc_fptr(*g, (void *)(uintptr_t)c->Rip);
+}
+#define FAULT_WRITE(uc) (((uc)->uc_mcontext->__es.__esr >> 6) & 1)   /* (ESR WnR) */
+#else
+#define FAULT_WRITE(uc) (((uc)->uc_mcontext.gregs[REG_ERR] & 2) ? 1 : 0)
 static void context_from(CONTEXT *c, const ucontext_t *uc) {
     const greg_t *g = uc->uc_mcontext.gregs;
     c->Rax = (DWORD64)g[REG_RAX], c->Rcx = (DWORD64)g[REG_RCX], c->Rdx = (DWORD64)g[REG_RDX], c->Rbx = (DWORD64)g[REG_RBX];
@@ -1097,6 +1326,7 @@ static void context_to(ucontext_t *uc, const CONTEXT *c) {
     g[REG_R12] = (greg_t)c->R12, g[REG_R13] = (greg_t)c->R13, g[REG_R14] = (greg_t)c->R14, g[REG_R15] = (greg_t)c->R15;
     g[REG_RIP] = (greg_t)c->Rip;
 }
+#endif
 static void on_signal(int sig, siginfo_t *si, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     EXCEPTION_RECORD rec;
@@ -1109,7 +1339,7 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
     rec.ExceptionAddress = (void *)(uintptr_t)ctx.Rip;
     if (sig == SIGSEGV || sig == SIGBUS) {
         rec.NumberParameters = 2;
-        rec.ExceptionInformation[0] = (uc->uc_mcontext.gregs[REG_ERR] & 2) ? 1 : 0;   /* (1: a write) */
+        rec.ExceptionInformation[0] = FAULT_WRITE(uc);   /* (1: a write) */
         rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
     }
     EXCEPTION_POINTERS ep = {&rec, &ctx};
@@ -1232,8 +1462,13 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
     (void)w, (void)type;
     fprintf(stderr, "%s: %s\n", caption ? caption : "Hookshot", text ? text : "");
     typedef int (*ShowFn)(uint32_t, const char *, const char *, void *);   /* (SDL3's and SDL2's alike; its result unread) */
+#if defined(__APPLE__)
+    void *sdl = dlopen("/opt/homebrew/lib/libSDL3.0.dylib", RTLD_NOW | RTLD_NOLOAD);
+    if (!sdl) sdl = dlopen("/opt/homebrew/lib/libSDL2-2.0.0.dylib", RTLD_NOW | RTLD_NOLOAD);
+#else
     void *sdl = dlopen("libSDL3.so.0", RTLD_NOW | RTLD_NOLOAD);
     if (!sdl) sdl = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_NOLOAD);
+#endif
     ShowFn show = sdl ? (ShowFn)dlsym(sdl, "SDL_ShowSimpleMessageBox") : NULL;
     if (show) show(0x10, caption ? caption : "Hookshot", text ? text : "", NULL);
     return 1;

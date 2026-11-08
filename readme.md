@@ -135,6 +135,30 @@ builds without it), Python 3 with `lz4`, `numpy`, `capstone`, `unicorn` and `zst
 (`scripts/linux/deps.sh` makes one).
 `scripts/linux/deps.sh` and `scripts/linux/appimage.sh` make the AppImage.
 
+### On macOS (Apple silicon, experimental)
+
+The Mac build follows the Linux one from a source checkout: the same POSIX runtime (`host/posix`), an arm64 Mach-O
+`hookshot` and `hookshot_vk.dylib`, linked by Apple's ld64, with the renderer on MoltenVK. It needs macOS 14.4 or newer.
+
+```bash
+xcode-select --install
+```
+
+```bash
+brew install python pkgconf sdl2-compat ffmpeg dav1d vulkan-loader molten-vk
+```
+
+1. Make a venv with `lz4 numpy capstone unicorn zstandard`, and a folder with Vulkan-Headers, SPIRV-Headers and
+   VulkanMemoryAllocator in CPM's layout (the versions in `scripts/linux/deps.sh`), for `RX_CPM`.
+2. Build with the venv's Python: `RX_CPM=<that folder> <venv>/bin/python -I nx2/make_game.py --nup <your .nup> --out
+   ~/Games/Hookshot --language en-US` (or `--romfs` and `--exefs`).
+3. Start `~/Games/Hookshot/hookshot` from that folder.
+
+How it differs from Linux: futexes are `os_sync_wait_on_address`, fibers and setjmp switch with arm64 assembly, guest
+pages are 4 KB on the host's 16 KB pages, the SDL window and the renderer's Metal surface live on the main thread, and
+Metal has no mesh shaders, so the game's task and mesh programs run through the compute fallback (issue 640). There is
+no `HOS_PROFILE`, processor affinity or thread priority boost on macOS.
+
 ### Updating to a newer release
 
 A new release is not a patch to your game folder: the game is built again from your copy, with the new code. Your

@@ -241,6 +241,10 @@ void gpu_time_collect(Recording& r) {
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
 }
 void gpu_time_begin(Recording& r) {
+    // (macos) an open timestamp query makes MoltenVK sample the GPU's counters at every Metal encoder boundary, a cost on every
+    // pass and barrier, and the M-series answered 0 anyway. Off on Apple GPUs; RX_VK_GPU_TIME=1: on
+    static const bool apple_off = dev.props.vendorID == 0x106b && !(getenv("RX_VK_GPU_TIME") && atoi(getenv("RX_VK_GPU_TIME")));
+    if (apple_off) return;
     if (!ts_pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;

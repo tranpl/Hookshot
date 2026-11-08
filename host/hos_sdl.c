@@ -11,7 +11,7 @@
 
 static int version;   /* 3, 2, or 0 none */
 static struct {
-    void *InitSubSystem, *SetHint, *GetError;
+    void *InitSubSystem, *SetHint, *GetError, *SetWindowTitle;
     /* window */
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
@@ -38,6 +38,7 @@ static int get_all(HMODULE m, int three) {
 #define GET2(field, n3, n2) GET(field, three ? n3 : n2)
     GET(InitSubSystem, "SDL_InitSubSystem");
     GET(SetHint, "SDL_SetHint");
+    GET(SetWindowTitle, "SDL_SetWindowTitle");
     GET(GetError, "SDL_GetError");
     GET(CreateWindow, "SDL_CreateWindow");
     GET(SetWindowFullscreen, "SDL_SetWindowFullscreen");
@@ -171,6 +172,9 @@ void hos_sdl_pixel_size(void *window, int *width, int *height) {
 }
 const uint8_t *hos_sdl_keys(int *count) {   /* (SDL3's bool and SDL2's Uint8: a byte each) */
     return CALL(const uint8_t *(*)(int *), GetKeyboardState)(count);
+}
+void hos_sdl_title(void *window, const char *title) {   /* (SDL3's bool and SDL2's void alike: the result unread) */
+    if (version) CALL(void (*)(void *, const char *), SetWindowTitle)(window, title);
 }
 void hos_sdl_icon(void *window, const char *png) {
     if (version != 3 || !f.LoadPNG || !f.SetWindowIcon || !f.DestroySurface) return;

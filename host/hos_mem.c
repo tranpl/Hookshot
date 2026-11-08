@@ -13,6 +13,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 #else
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h>
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&lock)
 #define UNLOCK() pthread_mutex_unlock(&lock)
@@ -291,7 +292,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
 #if defined(_WIN32)
         else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
 #else
-        else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
+        else if (hi > lo) {   /* (linux, macos: kept mapped, the pages read as zero: hos_main.c) */
             extern int hos_posix_guest_discard(void *p, size_t n);
             hos_posix_guest_discard(GP(lo), (size_t)(hi - lo));
         }

@@ -19,6 +19,14 @@
 #include <x86intrin.h>
 #define HOOKSHOT_RDTSC() ((uint64_t)__rdtsc())
 #define HOOKSHOT_PAUSE() _mm_pause()
+#elif defined(__aarch64__)   // (arm64, macOS: the virtual counter, calibrated against the clock as the TSC is below)
+static inline uint64_t hookshot_cntvct() {
+    uint64_t v;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+#define HOOKSHOT_RDTSC() hookshot_cntvct()
+#define HOOKSHOT_PAUSE() __asm__ __volatile__("yield")
 #endif
 
 typedef struct VmaAllocation_T* VmaAllocation;   // (vk_mem_alloc.h's handle)
