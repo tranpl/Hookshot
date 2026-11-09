@@ -223,7 +223,7 @@ int hos_posix_guest_discard(void *p, size_t n) {
         /* (given back first, then zeroed: they leave the process's footprint (1 GB -> 1 MB measured) and read as zero
            whether the kernel takes them or not. MADV_ZERO alone kept every page the game ever freed: 42 GB in Kokiri
            Forest, the GPU out of memory; the other order kept most of them) */
-        madvise((void *)a, b - a, MADV_FREE_REUSABLE);
+        if (!getenv("HOS_NO_GIVE_BACK")) madvise((void *)a, b - a, MADV_FREE_REUSABLE);
         if (madvise((void *)a, b - a, 11 /* MADV_ZERO */) != 0) memset((void *)a, 0, b - a);
         if (lo < a) memset((void *)lo, 0, a - lo);
         if (hi > b) memset((void *)b, 0, hi - b);

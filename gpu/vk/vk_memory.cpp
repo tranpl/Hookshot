@@ -1575,6 +1575,7 @@ std::condition_variable bg_cv, bg_done_cv;
 std::deque<std::pair<uint64_t, uint64_t>> bg_queue;
 std::vector<uint64_t> bg_inflight;           // (lo of the ranges queued or being imported)
 std::vector<std::pair<uint64_t, Pool>> bg_ready;
+std::pair<uint64_t, uint64_t> bg_busy{0, 0};   // (the range the thread is importing now; bg_mu)
 int64_t st_bg_imports, st_bg_waits, st_prefetch_sent, st_prefetch_used, st_prefetch_dropped;
 void bg_main();
 void bg_start() {   // (bg_mu held)
@@ -1594,10 +1595,12 @@ void bg_main() {
             bg_cv.wait(lk, [] { return !bg_queue.empty(); });
             r = bg_queue.front();
             bg_queue.pop_front();
+            bg_busy = r;
         }
         Pool p;
         const bool ok = import_pool(r.first, r.second, p);
         std::lock_guard lk(bg_mu);
+        bg_busy = {0, 0};
         p.prefetched = true;
         if (ok) bg_ready.push_back({r.first, p}), st_bg_imports++;
         std::erase(bg_inflight, r.first);
@@ -2137,6 +2140,15 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
     }
     for (const auto& nh : retired_pools)
         if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return 1;
+    // (and the background thread's: queued, under way, or made and not yet in the table. A chunk it imports ahead covers more
+    // than the game's pools, freed memory next to them too; pages given back under one (macOS: MADV_FREE_REUSABLE) were still
+    // the GPU's when the chunk was used: Invalid Resource, the device lost in Kokiri Forest's opening)
+    std::lock_guard bk(bg_mu);
+    if (bg_busy.second && bg_busy.first < hi && lo < bg_busy.second) return 1;
+    for (const auto& [a, b] : bg_queue)
+        if (a < hi && lo < b) return 1;
+    for (const auto& [k, bp] : bg_ready)
+        if (bp.lo < hi && lo < bp.hi) return 1;
     return 0;
 }
 

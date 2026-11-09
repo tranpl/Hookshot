@@ -777,7 +777,7 @@ static int zero_range(uintptr_t lo, uintptr_t hi, int prot) {
     if (b > a) {
         /* (in place: a new mapping under memory the Vulkan back end imported into Metal lost the device; see hos_main.c) */
         if (!(prot & PROT_WRITE)) return -1;
-        madvise((void *)a, b - a, MADV_FREE_REUSABLE);   /* (given back, then zeroed: hos_main.c) */
+        if (!getenv("HOS_NO_GIVE_BACK")) madvise((void *)a, b - a, MADV_FREE_REUSABLE);   /* (given back, then zeroed: hos_main.c) */
         if (madvise((void *)a, b - a, 11 /* MADV_ZERO */) != 0) memset((void *)a, 0, b - a);
         if (lo < a) memset((void *)lo, 0, a - lo);
         if (hi > b) memset((void *)b, 0, hi - b);
@@ -799,7 +799,16 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
     }
     if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE)) {
         /* (inside a reservation: made accessible; the guest window is accessible already) */
-        if ((uintptr_t)addr >= GUEST_LO && (uintptr_t)addr + size <= GUEST_HI) return addr;
+        if ((uintptr_t)addr >= GUEST_LO && (uintptr_t)addr + size <= GUEST_HI) {
+#if defined(__APPLE__)
+            /* (macos) memory given back when it was freed (MADV_FREE_REUSABLE, hos_main.c) is the game's again: marked so, or
+               the kernel could still take its pages after the Vulkan back end imported them into Metal (Invalid Resource) */
+            const uintptr_t hp = host_page();
+            const uintptr_t lo = (uintptr_t)addr & ~(hp - 1), hi = ((uintptr_t)addr + size + hp - 1) & ~(hp - 1);
+            madvise((void *)lo, hi - lo, MADV_FREE_REUSE);
+#endif
+            return addr;
+        }
         const uintptr_t lo = (uintptr_t)addr & ~(page - 1), hi = ((uintptr_t)addr + size + page - 1) & ~(page - 1);
         if (mprotect((void *)lo, hi - lo, prot_of(protect))) { fail_errno(); return NULL; }
         return addr;
