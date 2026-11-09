@@ -5169,6 +5169,25 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             else vkCmdDrawIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), std::max(d.stride, 16));
         }
     } else if (d.indexed) {
+        // (macos) Metal has no 8-bit indices: MoltenVK widens them on the GPU at every draw, the whole buffer bound from the
+        // draw's offset on (the rest of an imported pool here: 7 MB in, a 16 MB buffer of its own out, and the render pass
+        // ended for the compute pass that does it). Kokiri Forest's opening made ~2000 of those buffers, 31 GB, and Metal
+        // ran out of memory. The draw's own indices are widened here instead, into the stream. RX_VK_U8_INDICES=1: as elsewhere
+        static const bool widen8 = dev.props.vendorID == 0x106b && !(getenv("RX_VK_U8_INDICES") && atoi(getenv("RX_VK_U8_INDICES")));
+        if (d.itype == 0 && widen8 && d.count > 0) {
+            static thread_local std::vector<uint8_t> raw;
+            raw.resize((size_t)d.count);
+            const uint64_t at16 = memory_read_as_submitted(d.ibuf, raw.data(), raw.size()) ? stream_alloc((uint64_t)d.count * 2, 16) : UINT64_MAX;
+            if (at16 != UINT64_MAX) {
+                uint16_t* out = reinterpret_cast<uint16_t*>(cur->mapped + at16);
+                const bool restart = s.restart;   // (the 8-bit restart index as the 16-bit one)
+                for (size_t i = 0; i < raw.size(); i++) out[i] = restart && raw[i] == 0xFF ? (uint16_t)0xFFFF : (uint16_t)raw[i];
+                bind_index(cmd, cur->stream, at16, VK_INDEX_TYPE_UINT16);
+                vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+                st_draws++, pass.draws++;
+                return;
+            }
+        }
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         BufferRef ib;
         {

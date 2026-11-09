@@ -1522,6 +1522,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
     const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
+    // (ASTC the GPU samples as it is, Apple's: 16 bytes a block, not a texel. Counted a texel, Kokiri Forest's 1.2 GB of textures
+    // were 10.6 GB against a budget of 6, and the budget evicted textures in use every ten presents)
+    if (!x.sparse && !astc && is_astc(x.format)) x.bytes = px * x.layers * 16 / (uint64_t)std::max(1, bw * bh);
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;

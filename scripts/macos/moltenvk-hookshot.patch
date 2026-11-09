@@ -1,0 +1,110 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 8c24deb..9b7dc38 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -16,6 +16,8 @@
+  * limitations under the License.
+  */
+ 
++#include <execinfo.h>
++#include <atomic>
+ #include "MVKCommandBuffer.h"
+ #include "MVKFramebuffer.h"
+ #include "MVKCommandPool.h"
+@@ -1184,6 +1186,14 @@ void MVKCommandEncoder::setComputeBytes(id<MTLComputeCommandEncoder> mtlEncoder,
+ 
+ // Return the MTLBuffer allocation to the pool once the command buffer is done with it
+ const MVKMTLBufferAllocation* MVKCommandEncoder::getTempMTLBuffer(NSUInteger length, bool isPrivate, bool isDedicated) {
++    if (length >= (4u << 20) && getenv("MVK_LOG_ALLOCS")) {
++        static std::atomic<int> told{0};
++        if (told++ < 6) {
++            fprintf(stderr, "MVKTEMP %llu bytes private %d dedicated %d\n", (unsigned long long)length, (int)isPrivate, (int)isDedicated);
++            void* frames[12];
++            backtrace_symbols_fd(frames, backtrace(frames, 12), 2);
++        }
++    }
+     MVKMTLBufferAllocation* mtlBuffAlloc = getCommandEncodingPool()->acquireMTLBufferAllocation(length, isPrivate, isDedicated);
+     [_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> mcb) { mtlBuffAlloc->returnToPool(); }];
+     return mtlBuffAlloc;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
+index 3787d6b..4b666ff 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKMTLBufferAllocation.mm
+@@ -46,6 +46,7 @@ MVKMTLBufferAllocation* MVKMTLBufferAllocationPool::newObject() {
+ void MVKMTLBufferAllocationPool::addMTLBuffer() {
+     MTLResourceOptions mbOpts = (_mtlStorageMode << MTLResourceStorageModeShift) | MTLResourceCPUCacheModeDefaultCache;
+     _mtlBuffers.push_back({ [getMTLDevice() newBufferWithLength: _mtlBufferLength options: mbOpts], 0 });
++    if (getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKALLOC pool alloc%llu %llu\n", (unsigned long long)_allocationLength, (unsigned long long)_mtlBufferLength);
+ 	getDevice()->makeResident(_mtlBuffers.back().mtlBuffer);
+     _nextOffset = 0;
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 9772757..16bf13d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -3777,6 +3777,7 @@ MVKVisibilityBuffer::MVKVisibilityBuffer(id<MTLDevice> device, NSUInteger size,
+ 	@autoreleasepool {
+ 		MTLResourceOptions options = MTLResourceHazardTrackingModeUntracked | MTLResourceStorageModePrivate;
+ 		_buffer = [device newBufferWithLength:_halfSize * 2 options:options];
++		if (getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKALLOC visibility - %llu\n", (unsigned long long)_halfSize * 2);
+ 		if (_buffer) {
+ 			[_buffer setLabel:[NSString stringWithFormat:@"Metal Visibility Result Buffer %d", nameIdx]];
+ 			for (uint32_t gid = 0; gid < std::size(_fences); gid++) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+index e6e7786..fc0f6c6 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+@@ -226,6 +226,7 @@ bool MVKDeviceMemory::ensureMTLHeap() {
+ 	heapDesc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+ 	heapDesc.size = _allocationSize;
+ 	_mtlHeap = [getMTLDevice() newHeapWithDescriptor: heapDesc];	// retained
++	if (getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKALLOC heap - %llu\n", (unsigned long long)heapDesc.size);
+ 	[heapDesc release];
+ 	if (!_mtlHeap) { return false; }
+ 
+@@ -265,6 +266,8 @@ bool MVKDeviceMemory::ensureMTLBuffer() {
+ 		buf = [getMTLDevice() newBufferWithLength: memLen options: getMTLResourceOptions()];     // retained
+ 	}
+ 	if (!buf) { return false; }
++	if (getenv("MVK_LOG_ALLOCS") && memLen >= (1u << 20))
++		fprintf(stderr, "MVKALLOC buffer %s %llu\n", _mtlHeap ? "heap" : _isHostMemImported ? "import" : "own", (unsigned long long)memLen);
+ 	_device->makeResident(buf);
+ 	_device->getLiveResources().add(buf);
+ 	_pMemory = isMemoryHostAccessible() ? buf.contents : nullptr;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ef8ca60..8f7a8a1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -112,6 +112,15 @@ id<MTLTexture> MVKImagePlane::getMTLTexture() {
+         } else {
+             tex = [_image->getMTLDevice() newTextureWithDescriptor: mtlTexDesc];
+         }
++        if (getenv("MVK_LOG_ALLOCS")) {
++            const auto sa = [_image->getMTLDevice() heapTextureSizeAndAlignWithDescriptor: mtlTexDesc];
++            if (sa.size >= (1u << 20))
++                fprintf(stderr, "MVKALLOC texture %s %llu %lux%lux%lu x%lu levels %lu fmt %lu usage %#lx samples %lu\n",
++                        _heapAllocation.heap ? "heap" : memoryBinding->_mtlTexelBuffer ? "texelbuf" : "own", (unsigned long long)sa.size,
++                        (unsigned long)mtlTexDesc.width, (unsigned long)mtlTexDesc.height, (unsigned long)mtlTexDesc.depth,
++                        (unsigned long)mtlTexDesc.arrayLength, (unsigned long)mtlTexDesc.mipmapLevelCount,
++                        (unsigned long)mtlTexDesc.pixelFormat, (unsigned long)mtlTexDesc.usage, (unsigned long)mtlTexDesc.sampleCount);
++        }
+         if (tex.storageMode != MTLStorageModeMemoryless) {
+             _image->_device->makeResident(tex);
+             _image->_device->getLiveResources().add(tex);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index dec4b45..ed41627 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -485,7 +485,11 @@ VkResult MVKQueueCommandBufferSubmission::execute() {
+ // Returns the active MTLCommandBuffer, lazily retrieving it from the queue if needed.
+ id<MTLCommandBuffer> MVKQueueCommandBufferSubmission::getActiveMTLCommandBuffer() {
+ 	if ( !_activeMTLCommandBuffer ) {
+-		bool needsRetain = false;
++		// (Hookshot) MVK_RETAIN_REFERENCES=1: every command buffer keeps what it uses alive, residency sets or not. With a residency
++		// set none did, and a texture view released while its submission was being encoded was gone when the GPU reached it
++		// (Invalid Resource, the device lost)
++		static const bool retainAll = [] { const char* e = getenv("MVK_RETAIN_REFERENCES"); return e && e[0] == '1'; }();
++		bool needsRetain = retainAll;
+ 		if (!_device->hasResidencySet() && (getEnabledDescriptorIndexingFeatures().descriptorBindingPartiallyBound || getMVKConfig().liveCheckAllResources)) {
+ 			// Partially bound descriptors will get bound by us even if they're not used at runtime by the shader.
+ 			// The application is free to destroy them even if they're not used at runtime even if we bound them.
