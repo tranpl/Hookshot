@@ -1311,7 +1311,12 @@ uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to th
 
 void destroy_later(Texture& tex) {
     destroy_gen++;
-    Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
+    // (macos) at least everything submitted so far (a parallel replay thread may be recording a newer one): on Apple GPUs the programs take descriptor sets, not push descriptors
+    // (vk_draw.cpp), and a draw that kept its neighbour's set used a texture without bringing its last_value up. Metal's
+    // validation saw 200 textures destroyed while a submitted command buffer still needed them, and the device was lost
+    // (Invalid Resource) in Kokiri Forest's opening
+    const uint64_t at = dev.props.vendorID == 0x106b ? std::max({tex.last_value, rec_value, replay_newest_value()}) : tex.last_value;
+    Dead d{at, tex.image, tex.allocation, {}, {}};
     for (auto& kv : tex.views)
         if (kv.second) d.views.push_back(kv.second);
     d.memory = tex.sparse_chunks;
@@ -1437,6 +1442,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         x.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (x.samples == VK_SAMPLE_COUNT_1_BIT) x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    } else if (dev.props.vendorID == 0x106b && !(getenv("RX_VK_BLOCK_VIEWS") && atoi(getenv("RX_VK_BLOCK_VIEWS")))) {
+        // (macos) Metal cannot view a compressed texture as an uncompressed one: with block-texel views allowed, MoltenVK kept
+        // ASTC at 16 bytes a texel instead of about one (two 1365x1365x90 arrays of Kokiri Forest, 3.4 GB each; 11 GB of
+        // textures and the Mac out of memory). Only the sRGB / linear twins are viewed here. RX_VK_BLOCK_VIEWS=1: as elsewhere
+        flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     } else {
         // Raw storage views address one compressed block per texel (8 or 16 bytes).
         flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |

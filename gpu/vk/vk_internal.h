@@ -38,6 +38,7 @@ extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
+uint64_t replay_newest_value();   // (vk_replay.cpp: the newest submission handed to the replay)
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;

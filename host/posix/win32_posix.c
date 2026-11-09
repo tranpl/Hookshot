@@ -770,12 +770,15 @@ static int discard_pages(void *p, size_t n) {
     return madvise(p, n, MADV_DONTNEED);
 }
 #if defined(__APPLE__)
-/* (macos) decommitted memory reads as zero again: madvise does not promise it here, so the whole host pages are mapped
-   afresh and the 4 KB guest pages at the edges of a 16 KB host page are cleared in place */
+/* (macos) decommitted memory reads as zero again: madvise(MADV_DONTNEED) does not promise it here, so whole host pages are
+   zeroed with MADV_ZERO and the 4 KB guest pages at the edges of a 16 KB host page are cleared by hand */
 static int zero_range(uintptr_t lo, uintptr_t hi, int prot) {
     const uintptr_t hp = host_page(), a = (lo + hp - 1) & ~(hp - 1), b = hi & ~(hp - 1);
     if (b > a) {
-        if (mmap((void *)a, b - a, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+        /* (in place: a new mapping under memory the Vulkan back end imported into Metal lost the device; see hos_main.c) */
+        if (!(prot & PROT_WRITE)) return -1;
+        madvise((void *)a, b - a, MADV_FREE_REUSABLE);   /* (given back, then zeroed: hos_main.c) */
+        if (madvise((void *)a, b - a, 11 /* MADV_ZERO */) != 0) memset((void *)a, 0, b - a);
         if (lo < a) memset((void *)lo, 0, a - lo);
         if (hi > b) memset((void *)b, 0, hi - b);
     } else if (prot & PROT_WRITE) {

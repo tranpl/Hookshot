@@ -1512,9 +1512,13 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         st_tk_all += std::chrono::duration<double, std::milli>(tk2 - tk0).count();
         if (++n % 600 == 0) {
             logf("vk: a capture taken (ms): all %.3f; retires and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu "
-                 "spare buffers, %zu texture pages copied (%llu MB)", st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
+                 "spare buffers, %zu texture pages copied (%llu MB); oldest kept: value %llu, last use %llu; this %llu, completed %llu",
+                 st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
                  (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
-                 (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
+                 (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8),
+                 (unsigned long long)(cap_bufs.empty() ? 0 : cap_bufs.begin()->second.value),
+                 (unsigned long long)(cap_bufs.empty() ? 0 : cap_bufs.begin()->second.last_use), (unsigned long long)value,
+                 (unsigned long long)completed);
             st_tk_all = st_tk_stamp = st_tk_copy = 0;
         }
     }

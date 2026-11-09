@@ -49,6 +49,50 @@ CondNote cond_ring[1 << 15];
 uint32_t cond_ring_at = 0;
 namespace {
 
+// ---- (macos) waits for the GPU in slices, the counter read between them. On MoltenVK a timeline semaphore's host wait is
+// woken by a Metal shared-event listener; in Kokiri Forest's opening the game's main thread sat in vkWaitSemaphores for
+// seconds while the GPU was idle (a Metal System Trace: 114 ms of GPU work in 8 s), its work done. Elsewhere one wait, as before ----
+bool sliced_waits() {
+    static const bool v = dev.props.vendorID == 0x106b ? !(getenv("RX_VK_SLICED_WAITS") && !atoi(getenv("RX_VK_SLICED_WAITS")))
+                                                       : (getenv("RX_VK_SLICED_WAITS") && atoi(getenv("RX_VK_SLICED_WAITS")));
+    return v;
+}
+std::atomic<int64_t> st_late_wakes{0};
+VkResult wait_semaphore(VkSemaphore sem, uint64_t value, uint64_t timeout_ns) {
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &sem;
+    wi.pValues = &value;
+    if (!sliced_waits()) return vkWaitSemaphores(dev.device, &wi, timeout_ns);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        uint64_t have = 0;
+        const VkResult c = vkGetSemaphoreCounterValue(dev.device, sem, &have);
+        if (c != VK_SUCCESS) return c;
+        if (have >= value) return VK_SUCCESS;
+        const uint64_t waited = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (waited >= timeout_ns) return VK_TIMEOUT;
+        const uint64_t slice = std::min<uint64_t>(2000000ull, timeout_ns - waited);
+        const VkResult r = vkWaitSemaphores(dev.device, &wi, slice);
+        if (r == VK_SUCCESS || (r != VK_TIMEOUT)) return r;
+        if (vkGetSemaphoreCounterValue(dev.device, sem, &have) == VK_SUCCESS && have >= value) {
+            const int64_t n = ++st_late_wakes;
+            if (n <= 8 || n % 1000 == 0)
+                logf("vk: a semaphore wait was not woken when its value %llu was reached (%lld so far): taken from its counter",
+                     (unsigned long long)value, (long long)n);
+            return VK_SUCCESS;
+        }
+    }
+}
+VkResult wait_fence(VkFence fence) {
+    if (!sliced_waits()) return vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    for (;;) {
+        const VkResult r = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 2000000ull);
+        if (r != VK_TIMEOUT) return r;
+        if (vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 0) == VK_SUCCESS) return VK_SUCCESS;
+    }
+}
+
 // ---- submissions: a timeline semaphore; value n = the n-th submit done ----
 VkSemaphore timeline = VK_NULL_HANDLE;
 // ---- (hookshot) recordings by number: a second timeline, signalled at the end of every recording with its number, and the
@@ -105,16 +149,12 @@ void recording_wait(Recording& r) {
             std::lock_guard lk(dev.present_mu);
             if (batch_flushed < r.batch) flush_reason = FR_SLOT, queue_flush_locked();
         }
-        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &batch_tl;
-        wi.pValues = &r.batch;
-        vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
+        wait_semaphore(batch_tl, r.batch, UINT64_MAX);
         r.batch = 0;
         r.submitted = false;
         return;
     }
-    vkWaitForFences(dev.device, 1, &r.fence, VK_TRUE, UINT64_MAX);
+    wait_fence(r.fence);
     vkResetFences(dev.device, 1, &r.fence);
     r.submitted = false;
 }
@@ -200,22 +240,14 @@ void queue_flush_poll() {
 namespace {
 void wait_value(uint64_t v) {
     queue_flush_for(FR_VALUE);
-    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &timeline;
-    wi.pValues = &v;
-    vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
+    wait_semaphore(timeline, v, UINT64_MAX);
 }
 } // namespace
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
 void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
     if (!timeline || completed() >= v) return;
     queue_flush_for(FR_VALUE);
-    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &timeline;
-    wi.pValues = &v;
-    if (vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT) {
+    if (wait_semaphore(timeline, v, 250000000ull) == VK_TIMEOUT) {
         static std::atomic<int> logged{0};
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
     }
@@ -1958,11 +1990,7 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         if (it == value_rec.end()) return false;
         seq = it->second;
     }
-    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &rec_timeline;
-    wi.pValues = &seq;
-    *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+    *ok = wait_semaphore(rec_timeline, seq, timeout_ns) == VK_SUCCESS;
     return true;
 }
 uint64_t fence();
@@ -2015,12 +2043,8 @@ int wait(uint64_t f, uint64_t timeout_ns) {
             std::this_thread::yield();
         }
     }
-    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &timeline;
-    wi.pValues = &f;
     queue_flush_for(FR_WAIT);
-    const VkResult res = vkWaitSemaphores(dev.device, &wi, timeout_ns);
+    const VkResult res = wait_semaphore(timeline, f, timeout_ns);
     static int logged;
     if (res != VK_SUCCESS && timeout_ns > 1000000000ull && logged++ < 8)
         logf("vk: wait for fence %llu (done %llu, pushed %llu): %d", (unsigned long long)f,
@@ -2954,7 +2978,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     Frame& f = frames[frame_index];
     const int log_slot = frame_index;
     frame_index = (frame_index + 1) % 3;
-    vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX);
+    wait_fence(f.done);
     framelog_collect(log_slot);
     uint32_t index = 0;
 #ifdef _WIN32
@@ -3483,6 +3507,9 @@ uint64_t fence() { return async_on() || sync_waits_on() ? q_values.load() : push
 uint64_t get_pushed() { return fence(); }
 
 } // namespace
+/// (macos) the newest submission handed to the replay: anything that may still reference a texture going away was submitted by
+/// then (vk_texture.cpp destroy_later; the replay's parallel threads can be recording one newer than the evicting thread's)
+uint64_t replay_newest_value() { return std::max(pushed.load(), fence()); }
 
 bool replay_start() {
     menu_init();

@@ -4476,6 +4476,10 @@ bool fallback_compute_pipelines(Program& p) {
     static std::mutex mu;
     std::lock_guard lk(mu);
     if (!p.fallback_compute.empty()) return true;
+    // (a program whose compute pipeline the driver refused stays refused: tried again at every draw, MoltenVK converted and
+    // compiled the same shader thousands of times a minute in Kokiri Forest, 0.3 fps; its draws are left out instead)
+    static std::unordered_set<uint64_t> refused;
+    if (refused.count(p.key)) return false;
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -4492,7 +4496,9 @@ bool fallback_compute_pipelines(Program& p) {
         ci.layout = p.layout;
         if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {
             static std::atomic<int> told{0};
-            if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
+            if (told++ < 8) logf("vk: fallback: the compute pipeline of %016llx could not be made: its draws are left out", (unsigned long long)p.key);
+            for (VkPipeline pl : made) if (pl) vkDestroyPipeline(dev.device, pl, nullptr);
+            refused.insert(p.key);
             return false;
         }
         pcache_built_since_save++;

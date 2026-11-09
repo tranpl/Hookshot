@@ -214,11 +214,17 @@ int hos_guest_memfd = -1;
 int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
 int hos_posix_guest_discard(void *p, size_t n) {
 #if defined(__APPLE__)
-    /* (macos) madvise promises no zeros here: whole 16 KB host pages mapped afresh, the 4 KB guest pages at the edges cleared */
+    /* (macos) madvise(MADV_DONTNEED) promises no zeros here. MADV_ZERO zeroes whole 16 KB host pages in place, the 4 KB guest
+       pages at the edges cleared by hand. Never a new mapping: the Vulkan back end imports the window into Metal, and pages
+       mapped afresh under an import lost the device (Invalid Resource, kIOGPUCommandBufferCallbackErrorInvalidResource) */
     const uintptr_t hp = (uintptr_t)sysconf(_SC_PAGESIZE), lo = (uintptr_t)p, hi = lo + n;
     const uintptr_t a = (lo + hp - 1) & ~(hp - 1), b = hi & ~(hp - 1);
     if (b > a) {
-        if (mmap((void *)a, b - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+        /* (given back first, then zeroed: they leave the process's footprint (1 GB -> 1 MB measured) and read as zero
+           whether the kernel takes them or not. MADV_ZERO alone kept every page the game ever freed: 42 GB in Kokiri
+           Forest, the GPU out of memory; the other order kept most of them) */
+        madvise((void *)a, b - a, MADV_FREE_REUSABLE);
+        if (madvise((void *)a, b - a, 11 /* MADV_ZERO */) != 0) memset((void *)a, 0, b - a);
         if (lo < a) memset((void *)lo, 0, a - lo);
         if (hi > b) memset((void *)b, 0, hi - b);
     } else {
