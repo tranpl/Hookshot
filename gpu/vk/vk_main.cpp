@@ -86,6 +86,24 @@ bool create_instance() {
 #if defined(__APPLE__)
     // (macos) MoltenVK backs descriptor sets with Metal argument buffers, which the programs' aliased bindings need (vk_draw.cpp)
     setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+    // (macos) MoltenVK with Hookshot's patch beside the game (MoltenVK_icd.json and libMoltenVK.dylib, scripts/macos/moltenvk.sh):
+    // the loader takes it instead of Homebrew's, and its MVK_RETAIN_REFERENCES keeps what a command buffer uses alive. Without
+    // it, on a Mac with Metal residency sets, a texture view released while its submission was encoded was gone when the GPU
+    // read it (Invalid Resource, the device lost in Kokiri Forest's opening)
+    setenv("MVK_RETAIN_REFERENCES", "1", 0);
+    {
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string icd(exe, n);
+        icd = icd.substr(0, icd.find_last_of("\\/") + 1) + "MoltenVK_icd.json";
+        if (FILE* f = fopen(icd.c_str(), "rb")) {
+            fclose(f);
+            if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
+                setenv("VK_DRIVER_FILES", icd.c_str(), 1);
+                logf("vk: MoltenVK from %s", icd.c_str());
+            }
+        }
+    }
     // (macos, MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0 tried: encoding on MoltenVK's own thread took half the graphics thread's time off
     // it, but an event the other queue waits for then stopped advancing (0x100d6c8048 stuck while its waits went on), and near the
     // Deku Tree every queue went on only after hold_ms: 2 fps. MoltenVK's default, synchronous submits, until that is understood)
