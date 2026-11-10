@@ -2170,6 +2170,17 @@ void invalidate(uint64_t gpu, uint64_t size) {
                          std::chrono::duration_cast<std::chrono::nanoseconds>(w1 - w0).count() / 1e6, (unsigned long long)v,
                          (unsigned long long)f0, (unsigned long long)c0, (int)behind0);
             }
+            {   // (RX_VK_LOG_READBACK_AFTER=<present>: small results as the CPU is about to read them, after the wait, 600 of them)
+                static const int64_t after = getenv("RX_VK_LOG_READBACK_AFTER") ? atoll(getenv("RX_VK_LOG_READBACK_AFTER")) : -1;
+                static std::atomic<int> n{0};
+                if (after >= 0 && presents_now >= after && size <= 0x100 && n++ < 600) {
+                    uint32_t q[8]{};
+                    host->gpu_read(gpu, q, sizeof q);
+                    logf("vk: readback-after %lld %#llx +%#llx: waited %d, value %llu done %llu | %08x %08x %08x %08x %08x %08x %08x %08x",
+                         (long long)presents_now, (unsigned long long)gpu, (unsigned long long)size, (int)w, (unsigned long long)v,
+                         (unsigned long long)completed(), q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+                }
+            }
             if (++calls % 3000 == 0) {
                 const int64_t n = waited.exchange(0);
                 logf("vk: readbacks of GPU results: %lld of 3000 waited for their write-back, %.2f ms each", (long long)n,
