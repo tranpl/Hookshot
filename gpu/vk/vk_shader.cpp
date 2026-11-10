@@ -481,6 +481,11 @@ Shader::Profile make_profile() {
         if (cs) m |= bit(Shader::Stage::Compute) | bit(Shader::Stage::Task) | bit(Shader::Stage::Mesh);
         p.supported_subgroup_stages = m;
     }
+    // (macos) Metal compiles a vertex function free to work its position out differently from another's, unless the position
+    // is invariant (MoltenVK then compiles it with preserveInvariance). OoT draws depth first and colour after it with the depth
+    // test at equal, from two programs: where the two positions came out a bit apart the colour pass drew nothing and the sky
+    // stayed, white-hot silhouettes of grass, ferns, leaves or Link coming and going with the camera
+    p.invariant_position = dev.props.vendorID == 0x106b;
     p.support_viewport_index_layer_non_geometry = true;
     p.support_typeless_image_loads = true;
     p.support_demote_to_helper_invocation = true;
