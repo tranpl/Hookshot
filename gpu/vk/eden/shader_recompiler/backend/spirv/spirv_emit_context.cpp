@@ -2249,6 +2249,9 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     Name(mesh_primitive_count, "isbe_primitive_count");
 
     if (mesh_fallback) {
+        // (where this workgroup's records start: one thread takes the place, the others read it here)
+        mesh_fallback_base = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_fallback_base, "fallback_base");
         return;   // (no mesh outputs here: the epilogue writes records)
     }
 

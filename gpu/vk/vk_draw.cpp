@@ -4596,8 +4596,11 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
                                          : (uint32_t)std::min<uint64_t>(
                                                (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity))
                              : 0};
+    // (RX_VK_FALLBACK_TEST, to see what each part costs: 1 no draw, 2 no mesh dispatch either, 3 no dispatch at all)
+    static const int fb_test = getenv("RX_VK_FALLBACK_TEST") ? atoi(getenv("RX_VK_FALLBACK_TEST")) : 0;
     auto send = [&](size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
+        if (fb_test >= 3 || (fb_test == 2 && mesh_stage)) return true;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
         if (mesh_stage && p.fallback_task) {
             if (!slots) return true;
@@ -5023,7 +5026,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (d.mesh) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
-            if (fallback_vertex_count && fallback_draw_buffer) vkCmdDrawIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 16);
+            static const bool fb_no_draw = getenv("RX_VK_FALLBACK_TEST") && atoi(getenv("RX_VK_FALLBACK_TEST")) >= 1;
+            if (fallback_vertex_count && fallback_draw_buffer && !fb_no_draw) vkCmdDrawIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 16);
             st_mesh++;
             st_draws++, pass.draws++;
             return;

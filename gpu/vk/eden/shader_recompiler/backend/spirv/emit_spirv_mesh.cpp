@@ -191,49 +191,55 @@ Id LineWord(EmitContext& ctx, Id array, Id element, u32 base, u32 num_lines, u32
         SharedWord(ctx, array, ctx.OpIAdd(ctx.U32[1], first, ctx.Const(line * 32))));
 }
 
-/// A mesh workgroup writes its primitive count (a task's flag first bounds it) and its primitives' corners.
+/// A mesh workgroup takes as many records as its primitives have corners, after the ones taken before it, and writes them.
+/// (The records were a fixed place for each slot, max_primitives * corners of them, and the draw covered every one: a
+/// meshlet of 40 triangles cost the vertex stage as much as one of 126, and so did a slot nothing ran in.)
 void MeshFallbackEpilogue(EmitContext& ctx) {
     const MeshInfo& mesh{ctx.mesh_info};
     const u32 corners{mesh.Corners()};
     const u32 words{FallbackRecordWords(mesh)};
     const u32 per_slot{mesh.max_primitives * corners};
+    const u32 most{MESH_FALLBACK_CAPACITY * per_slot};   // (the records the buffer holds)
     Barrier(ctx);
     const Id slot{WorkgroupId(ctx)};
-    If(ctx, ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
-        Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
-                            ctx.Const(mesh.max_primitives))};
-        if (ctx.runtime_info.mesh_fallback_task) {
-            // (a task thread starts at most one mesh workgroup: the slots it did not start output nothing)
-            const Id started{ctx.OpLoad(
-                ctx.U32[1], BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot))};
-            count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, started, ctx.u32_zero_value),
-                                 ctx.u32_zero_value, count);
-        }
-        If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
-            ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot), count);
-            // (the draw's vertex count, after the records: each mesh workgroup that ran adds its corners, and the draw
-            // takes it from there (an indirect draw). It was the whole buffer's, 1024 slots, whatever ran)
-            const Id total{BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                      ctx.Const(MESH_FALLBACK_CAPACITY * (1U + per_slot * words)))};
-            ctx.OpAtomicIAdd(ctx.U32[1], total, ctx.Const(static_cast<u32>(spv::Scope::Device)),
-                             ctx.u32_zero_value, ctx.Const(per_slot));
-        });
-        const Id invocation{LocalInvocation(ctx)};
-        Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
-            If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
-                for (u32 corner = 0; corner < corners; ++corner) {
-                    const Id byte{ctx.OpIAdd(
-                        ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
-                        ctx.Const(4U + corner))};
-                    // (an index byte the program left unwritten is held to the vertex count)
-                    const Id vertex{Clamped(
-                        ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
-                        mesh.max_vertices)};
-                    const Id record{ctx.OpIAdd(
-                        ctx.U32[1], ctx.OpIMul(ctx.U32[1], slot, ctx.Const(per_slot)),
-                        ctx.OpIAdd(ctx.U32[1],
-                                   ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
-                                   ctx.Const(corner)))};
+    Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                        ctx.Const(mesh.max_primitives))};
+    if (ctx.runtime_info.mesh_fallback_task) {
+        // (a task thread starts at most one mesh workgroup: the slots it did not start output nothing)
+        const Id started{ctx.OpLoad(
+            ctx.U32[1], BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
+                                     ctx.OpUMin(ctx.U32[1], slot, ctx.Const(MESH_FALLBACK_CAPACITY - 1U))))};
+        count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, started, ctx.u32_zero_value),
+                             ctx.u32_zero_value, count);
+    }
+    count = ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), count,
+                         ctx.u32_zero_value);
+    If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
+        // (the draw's vertex count, after the records: the draw takes it from there, an indirect draw)
+        const Id total{BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                  ctx.Const(MESH_FALLBACK_CAPACITY + most * words))};
+        ctx.OpStore(ctx.mesh_fallback_base,
+                    ctx.OpAtomicIAdd(ctx.U32[1], total, ctx.Const(static_cast<u32>(spv::Scope::Device)),
+                                     ctx.u32_zero_value, ctx.OpIMul(ctx.U32[1], count, ctx.Const(corners))));
+    });
+    Barrier(ctx);
+    const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_base)};
+    const Id invocation{LocalInvocation(ctx)};
+    Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
+        If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
+            for (u32 corner = 0; corner < corners; ++corner) {
+                const Id byte{ctx.OpIAdd(
+                    ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
+                    ctx.Const(4U + corner))};
+                // (an index byte the program left unwritten is held to the vertex count)
+                const Id vertex{Clamped(
+                    ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
+                    mesh.max_vertices)};
+                const Id record{ctx.OpIAdd(
+                    ctx.U32[1], base,
+                    ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
+                               ctx.Const(corner)))};
+                If(ctx, ctx.OpULessThan(ctx.U1, record, ctx.Const(most)), [&] {
                     const Id word{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
                                              ctx.OpIMul(ctx.U32[1], record, ctx.Const(words)))};
                     ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index, word),
@@ -242,8 +248,7 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                         const Id value{LineWord(ctx, ctx.mesh_attributes, vertex, 0,
                                                 static_cast<u32>(mesh.vertex_lines.size()), line)};
                         ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                               ctx.OpIAdd(ctx.U32[1], word,
-                                                          ctx.Const(1U + line))),
+                                               ctx.OpIAdd(ctx.U32[1], word, ctx.Const(1U + line))),
                                     value);
                     }
                     for (u32 line = 0; line < mesh.primitive_lines.size(); ++line) {
@@ -253,12 +258,11 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                         ctx.OpStore(
                             BufferWord(ctx, ctx.mesh_fallback_records_member_index,
                                        ctx.OpIAdd(ctx.U32[1], word,
-                                                  ctx.Const(
-                                                      static_cast<u32>(1U + mesh.vertex_lines.size()) + line))),
+                                                  ctx.Const(static_cast<u32>(1U + mesh.vertex_lines.size()) + line))),
                             value);
                     }
-                }
-            });
+                });
+            }
         });
     });
 }
@@ -432,23 +436,13 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
     const u32 words{FallbackRecordWords(mesh)};
     const u32 per_slot{mesh.max_primitives * corners};
+    // (one record a vertex, in the order the mesh workgroups took them)
+    const u32 most{MESH_FALLBACK_CAPACITY * per_slot};
     const Id vertex{ctx.OpLoad(ctx.U32[1], ctx.vertex_index)};
-    const Id slot{ctx.OpUDiv(ctx.U32[1], vertex, ctx.Const(per_slot))};
-    const Id within{ctx.OpUMod(ctx.U32[1], vertex, ctx.Const(per_slot))};
-    const Id primitive{ctx.OpUDiv(ctx.U32[1], within, ctx.Const(corners))};
-    const Id corner{ctx.OpUMod(ctx.U32[1], within, ctx.Const(corners))};
-    const Id count{ctx.OpLoad(
-        ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot))};
-    const Id record{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
-                               ctx.OpIMul(ctx.U32[1],
-                                          ctx.OpIAdd(ctx.U32[1],
-                                                     ctx.OpIMul(ctx.U32[1], slot, ctx.Const(per_slot)),
-                                                     ctx.OpIAdd(ctx.U32[1],
-                                                                ctx.OpIMul(ctx.U32[1], primitive,
-                                                                           ctx.Const(corners)),
-                                                                corner)),
-                                          ctx.Const(words)))};
-    const Id first{record};
+    const Id inside{ctx.OpULessThan(ctx.U1, vertex, ctx.Const(most))};
+    const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                              ctx.OpIMul(ctx.U32[1], ctx.OpUMin(ctx.U32[1], vertex, ctx.Const(most - 1U)),
+                                         ctx.Const(words)))};
     const Id valid{ctx.OpLoad(
         ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_records_member_index, first))};
     const auto read = [&](u32 word) {
@@ -485,7 +479,7 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
         }
     }
     // (a record past the workgroup's primitive count, or one no mesh workgroup wrote: outside the clip volume)
-    If(ctx, ctx.OpLogicalOr(ctx.U1, ctx.OpUGreaterThanEqual(ctx.U1, primitive, count),
+    If(ctx, ctx.OpLogicalOr(ctx.U1, ctx.OpLogicalNot(ctx.U1, inside),
                             ctx.OpIEqual(ctx.U1, valid, ctx.u32_zero_value)),
        [&] {
            StorePosition(ctx, 0, ctx.f32_zero_value);
