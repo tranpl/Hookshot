@@ -91,6 +91,11 @@ bool create_instance() {
     // it, on a Mac with Metal residency sets, a texture view released while its submission was encoded was gone when the GPU
     // read it (Invalid Resource, the device lost in Kokiri Forest's opening)
     setenv("MVK_RETAIN_REFERENCES", "1", 0);
+    // (no fast math in Metal's compiler: the game draws depth first and colour after it with the depth test at equal, from two
+    // programs that work the same positions out. Compiled with fast math, the two came out a bit apart for some of them: the
+    // colour pass drew nothing there and the sky stayed, white-hot patches the shape of grass, leaves or a whole character,
+    // coming and going with the camera)
+    setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
     {
         char exe[MAX_PATH];
         const DWORD n = game_module_path(exe, MAX_PATH);
