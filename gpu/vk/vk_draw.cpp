@@ -1709,6 +1709,13 @@ void dump_input(char kind, uint32_t index, uint32_t handle, const Texture* tex) 
                  tex->gpu_written ? "/G" : "", tex->uploaded ? "/U" : "");
     }
     dump_inputs += b;
+    if (kind == 't') {   // (its sampler: the filters and the level range the game set)
+        nvn_samp_par sp{};
+        const bool have = sampler_of((int)(handle >> 20), &sp);
+        snprintf(b, sizeof b, "/s%u%s:min%d,mag%d,lod%g-%g", handle >> 20, have ? "" : "(none)", (int)sp.minf, (int)sp.magf,
+                 (double)sp.lod_min, (double)sp.lod_max);
+        dump_inputs += b;
+    }
 }
 
 /// A descriptor over 2 ms is logged, 40 times, and only while RX_VK_SLOW_DESC is set. Off, the clock is not read.

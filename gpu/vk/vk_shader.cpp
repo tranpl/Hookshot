@@ -1099,6 +1099,24 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
                 ok = false;
                 break;
             }
+            // (RX_VK_DUMP_SPV=<folder> with RX_VK_DUMP_SPV_KEYS=<key prefix>[,...]: a kept program's stages too, as
+            // <key>_<variant>_<stage>.spv, for spirv-cross)
+            if (const char* dir = getenv("RX_VK_DUMP_SPV"))
+                if (const char* keys = getenv("RX_VK_DUMP_SPV_KEYS")) {
+                    char hex[24];
+                    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
+                    for (const char* q = keys; *q;) {
+                        const char* e = q;
+                        while (*e && *e != ',') e++;
+                        if (e > q && !strncmp(hex, q, (size_t)(e - q))) {
+                            char path[512];
+                            snprintf(path, sizeof path, "%s/%s_%016llx_%llu_%x.spv", dir, hex, (unsigned long long)p->variant,
+                                     (unsigned long long)k, (unsigned)st.vk_stage);
+                            if (FILE* f = fopen(path, "wb")) fwrite(spirv.data(), 4, spirv.size(), f), fclose(f);
+                        }
+                        q = *e ? e + 1 : e;
+                    }
+                }
             st.module = make_module(spirv);
             ok = ok && st.module;
         }
