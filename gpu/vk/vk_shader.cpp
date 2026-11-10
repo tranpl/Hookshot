@@ -466,6 +466,21 @@ Shader::Profile make_profile() {
     p.support_fp16_signed_zero_nan_preserve = p.support_fp32_signed_zero_nan_preserve = true;
     p.support_vote = true;
     p.supported_subgroup_stages = VK_SHADER_STAGE_ALL;
+    if (dev.sg_stages != VK_SHADER_STAGE_ALL) {
+        // (macos) by Shader::Stage, from the device's stages (vk_main.cpp): a stage without subgroup operations takes the
+        // translator's single-lane forms (lane 0, a vote or ballot of its own predicate). A task or mesh stage runs as a
+        // compute shader there (the fallback), so it has what compute has
+        const auto bit = [](Shader::Stage s) { return 1u << static_cast<u32>(s); };
+        const bool vs = dev.sg_stages & VK_SHADER_STAGE_VERTEX_BIT, cs = dev.sg_stages & VK_SHADER_STAGE_COMPUTE_BIT;
+        u32 m = 0;
+        if (vs) m |= bit(Shader::Stage::VertexA) | bit(Shader::Stage::VertexB);
+        if (dev.sg_stages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) m |= bit(Shader::Stage::TessellationControl);
+        if (dev.sg_stages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) m |= bit(Shader::Stage::TessellationEval);
+        if (dev.sg_stages & VK_SHADER_STAGE_GEOMETRY_BIT) m |= bit(Shader::Stage::Geometry);
+        if (dev.sg_stages & VK_SHADER_STAGE_FRAGMENT_BIT) m |= bit(Shader::Stage::Fragment);
+        if (cs) m |= bit(Shader::Stage::Compute) | bit(Shader::Stage::Task) | bit(Shader::Stage::Mesh);
+        p.supported_subgroup_stages = m;
+    }
     p.support_viewport_index_layer_non_geometry = true;
     p.support_typeless_image_loads = true;
     p.support_demote_to_helper_invocation = true;

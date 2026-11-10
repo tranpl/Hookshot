@@ -383,6 +383,10 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         const bool pin = f13.subgroupSizeControl && sc.minSubgroupSize <= 32 && sc.maxSubgroupSize >= 32 && !getenv("RX_VK_NO_SUBGROUP_PIN");
         dev.sg32_stages = pin ? sc.requiredSubgroupSizeStages : 0;
+        // (macos) Metal has subgroup (SIMD-group) functions in fragment and compute functions only: MoltenVK refuses a vertex
+        // shader that uses them ("Subgroup builtins are not available in this type of function"), its pipeline is not made and
+        // its draws are lost (Kokiri Forest's ground and leaves). The translator is told which stages have them (vk_shader.cpp)
+        if (dev.props.vendorID == 0x106b && !getenv("RX_VK_SUBGROUP_ALL_STAGES")) dev.sg_stages = sg.supportedStages;
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
              (unsigned)dev.sg32_stages);
     }

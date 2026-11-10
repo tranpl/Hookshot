@@ -46,7 +46,7 @@ Id PayloadWord(EmitContext& ctx, Id index) {
         const Id first{ctx.OpIAdd(
             ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
             ctx.OpIMul(ctx.U32[1], slot, ctx.Const(ctx.mesh_info.payload_words)))};
-        return BufferWordAt(ctx, PushU64(ctx, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET),
+        return BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
                             ctx.OpIAdd(ctx.U32[1], first,
                                        Clamped(ctx, index, ctx.mesh_info.payload_words)));
     }
@@ -131,6 +131,9 @@ u32 FallbackRecordWords(const MeshInfo& mesh) {
            static_cast<u32>(mesh.primitive_lines.size());
 }
 
+/// (member: the push constant block's member index, not its byte offset. The payload's was read by its offset, 64: an
+/// access chain past the block's five or six members, which SPIRV-Cross refuses ("Member index is out of bounds!"), so on
+/// MoltenVK the task programs' compute pipelines were never made and their draws were left out)
 Id PushU64(EmitContext& ctx, u32 member) {
     const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U64)};
     return ctx.OpLoad(
@@ -202,7 +205,7 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
         if (ctx.runtime_info.mesh_fallback_task) {
             // (a task thread starts at most one mesh workgroup: the slots it did not start output nothing)
             const Id started{ctx.OpLoad(
-                ctx.U32[1], BufferWordAt(ctx, PushU64(ctx, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET), slot))};
+                ctx.U32[1], BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot))};
             count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, started, ctx.u32_zero_value),
                                  ctx.u32_zero_value, count);
         }
@@ -304,7 +307,7 @@ void TaskEpilogue(EmitContext& ctx) {
         // and the rest stay culled.)
         const Id started{ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count)};
         If(ctx, ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
-            ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET), slot),
+            ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot),
                         started);
             If(ctx, started, [&] {
                 const Id first{ctx.OpIAdd(
@@ -312,7 +315,7 @@ void TaskEpilogue(EmitContext& ctx) {
                     ctx.OpIMul(ctx.U32[1], slot, ctx.Const(ctx.mesh_info.payload_words)))};
                 const Id invocation{LocalInvocation(ctx)};
                 Strided(ctx, ctx.mesh_info.payload_words, ctx.mesh_threads, invocation, [&](Id index) {
-                    ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET),
+                    ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
                                              ctx.OpIAdd(ctx.U32[1], first, index)),
                                 ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index)));
                 });

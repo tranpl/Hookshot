@@ -108,3 +108,71 @@ index dec4b45..ed41627 100644
  		if (!_device->hasResidencySet() && (getEnabledDescriptorIndexingFeatures().descriptorBindingPartiallyBound || getMVKConfig().liveCheckAllResources)) {
  			// Partially bound descriptors will get bound by us even if they're not used at runtime by the shader.
  			// The application is free to destroy them even if they're not used at runtime even if we bound them.
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..f5ad7ce 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include <atomic>
+ #include "MVKShaderModule.h"
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+@@ -73,7 +74,10 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
+ 												VkPipelineCreationFeedback* pShaderFeedback,
+ 												MVKShaderModule* shaderModule) {
+ 
+-	if ( !_mtlLibrary ) { return MVKMTLFunctionNull; }
++	if ( !_mtlLibrary ) {
++		if (getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKSHADER no MTLLibrary for function %s\n", _shaderConversionResultInfo.entryPoint.mtlFunctionName.c_str());
++		return MVKMTLFunctionNull;
++	}
+ 
+ 	id<MTLLibrary> lib = _mtlLibrary;
+ 
+@@ -116,6 +120,18 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
+ 
+ 			uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
+ 			id<MTLFunction> mtlFunc = [[lib newFunctionWithName: mtlFuncName] autorelease];
++			if (!mtlFunc && getenv("MVK_FAIL_DUMP")) {
++				static std::atomic<int> n{0};
++				const int k = n++;
++				if (k < 12) {
++					std::string msl;
++					_compressedMSL.decompress(msl);
++					char path[512];
++					snprintf(path, sizeof path, "%s/fail_%02d.metal", getenv("MVK_FAIL_DUMP"), k);
++					if (FILE* f = fopen(path, "wb")) { fwrite(msl.data(), 1, msl.size(), f); fclose(f); }
++				}
++			}
++			if (!mtlFunc && getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKSHADER library has no function %s (it has: %s)\n", mtlFuncName.UTF8String, [[lib.functionNames componentsJoinedByString: @","] UTF8String]);
+ 			addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
+ 			if (pShaderFeedback) {
+ 				if (mtlFunc) {
+@@ -412,6 +428,7 @@ MVKMTLFunction MVKShaderModule::getMTLFunction(SPIRVToMSLConversionConfiguration
+ 		pShaderConfig->markAllInterfaceVarsAndResourcesUsed();
+ 	}
+ 
++	if (!mvkLib && getenv("MVK_LOG_ALLOCS")) fprintf(stderr, "MVKSHADER no shader library (conversion failed) for entry point %s\n", pShaderConfig->options.entryPointName.c_str());
+ 	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
+ }
+ 
+@@ -465,6 +482,16 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 		if (shouldLogCode) { MVKLogInfo("%s", conversionResult.resultLog.c_str()); }
+ 	} else {
+ 		reportError(VK_ERROR_INITIALIZATION_FAILED, "Unable to convert SPIR-V to MSL:\n%s", conversionResult.resultLog.c_str());
++		if (getenv("MVK_FAIL_DUMP")) {
++			static std::atomic<int> n{0};
++			const int k = n++;
++			if (k < 12) {
++				const auto& spv = _spvConverter.getSPIRV();
++				char path[512];
++				snprintf(path, sizeof path, "%s/fail_%02d.spv", getenv("MVK_FAIL_DUMP"), k);
++				if (FILE* f = fopen(path, "wb")) { fwrite(spv.data(), 4, spv.size(), f); fclose(f); }
++			}
++		}
+ 	}
+ 	return wasConverted;
+ }
