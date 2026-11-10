@@ -665,6 +665,16 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n) {
     return true;
 }
 
+// (a translation job reads handles out of uniform buffers on its own thread (record_answers): the list of updates is the
+// replay thread's, which adds to and drops from it meanwhile; a job that walked it read an update already freed, and the
+// game stopped with an access violation in ub_read at a change of area, when many programs are translated at once. The job
+// reads guest memory as submitted, without the stream's updates over it)
+size_t ub_updates_limit(size_t limit) {
+    const size_t old = ub_limit;
+    ub_limit = limit;
+    return old;
+}
+
 namespace {
 
 /// The recording's uniform updates into guest memory (after its draws: the ones that came after an update read
