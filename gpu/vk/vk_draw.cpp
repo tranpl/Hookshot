@@ -4446,6 +4446,23 @@ thread_local std::unordered_map<const Program*, FallbackBuffers> fallback_buffer
 thread_local uint32_t fallback_vertex_count = 0;
 thread_local VkBuffer fallback_draw_buffer = VK_NULL_HANDLE;   // (the draw's arguments, which the mesh workgroups fill)
 thread_local VkDeviceSize fallback_draw_offset = 0;
+thread_local VkDeviceSize fallback_index_offset = 0;   // (drawn indexed: where the indices start; 0, a record a corner)
+/// (the records buffer as the mesh epilogue lays it out, emit_spirv_mesh.cpp: in words)
+struct FallbackLayout { uint64_t index_word, args_word, words; bool indexed; };
+FallbackLayout fallback_layout(const Program& p) {
+    const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    FallbackLayout l{};
+    l.indexed = p.fallback_max_vertices != 0;
+    if (l.indexed) {
+        l.index_word = capacity + capacity * (uint64_t)p.fallback_max_vertices * p.fallback_record_words;
+        l.args_word = l.index_word + capacity * (uint64_t)p.fallback_vertices_per_workgroup;
+        l.words = l.args_word + 8;   // (index count, instances, first index, vertex offset, first instance; the vertex counter)
+    } else {
+        l.args_word = capacity + capacity * (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words;
+        l.words = l.args_word + 4;   // (vertex count, instances, first vertex, first instance)
+    }
+    return l;
+}
 
 uint64_t fallback_buffer_address(VkBuffer buffer) {
     VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -4463,13 +4480,13 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     f.tried = true;
     const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     if (!p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
-    // (+ the draw's arguments after the records: the vertex count the mesh workgroups add up, 1 instance, 0, 0)
-    const uint64_t records = capacity * 4 +
-                             capacity * (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words * 4 + 16;
+    (void)capacity;
+    const uint64_t records = fallback_layout(p).words * 4;
     if (records > (512ull << 20)) return false;
     void* mapped = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
     f.records_address = fallback_buffer_address(f.records);
     if (p.fallback_task) {
@@ -4565,11 +4582,13 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     end_pass(cmd);
     vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
-    // (the draw's arguments: 0 vertices until the mesh workgroups add theirs, 1 instance)
-    const VkDeviceSize draw_args = (VkDeviceSize)capacity * 4 * (1 + (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words);
-    vkCmdFillBuffer(cmd, f->records, draw_args, 16, 0);
+    // (the draw's arguments: 0 vertices (indices) until the mesh workgroups add theirs, 1 instance; the vertex counter 0)
+    const FallbackLayout fl = fallback_layout(p);
+    const VkDeviceSize draw_args = fl.args_word * 4;
+    vkCmdFillBuffer(cmd, f->records, draw_args, fl.indexed ? 32 : 16, 0);
     vkCmdFillBuffer(cmd, f->records, draw_args + 4, 4, 1);
     fallback_draw_buffer = f->records, fallback_draw_offset = draw_args;
+    fallback_index_offset = fl.indexed ? fl.index_word * 4 : 0;
     // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words. After them the
     // task's slot counter, which is the mesh dispatch's count: (slots taken, 1, 1))
     const VkDeviceSize mesh_args = (VkDeviceSize)capacity * 4 * (1 + (uint64_t)p.fallback_payload_words);
@@ -5027,7 +5046,14 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (d.mesh) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
             static const bool fb_no_draw = getenv("RX_VK_FALLBACK_TEST") && atoi(getenv("RX_VK_FALLBACK_TEST")) >= 1;
-            if (fallback_vertex_count && fallback_draw_buffer && !fb_no_draw) vkCmdDrawIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 16);
+            if (fallback_vertex_count && fallback_draw_buffer && !fb_no_draw) {
+                if (fallback_index_offset) {   // (a record a vertex: the indices the mesh workgroups wrote)
+                    bind_index(cmd, fallback_draw_buffer, fallback_index_offset, VK_INDEX_TYPE_UINT32);
+                    vkCmdDrawIndexedIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 20);
+                } else {
+                    vkCmdDrawIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 16);
+                }
+            }
             st_mesh++;
             st_draws++, pass.draws++;
             return;

@@ -2252,6 +2252,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         // (where this workgroup's records start: one thread takes the place, the others read it here)
         mesh_fallback_base = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
         Name(mesh_fallback_base, "fallback_base");
+        mesh_fallback_vbase = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_fallback_vbase, "fallback_vbase");
         return;   // (no mesh outputs here: the epilogue writes records)
     }
 

@@ -191,6 +191,87 @@ Id LineWord(EmitContext& ctx, Id array, Id element, u32 base, u32 num_lines, u32
         SharedWord(ctx, array, ctx.OpIAdd(ctx.U32[1], first, ctx.Const(line * 32))));
 }
 
+/// (hookshot) A mesh program with no per-primitive outputs is drawn indexed: a record a vertex and an index a corner. A
+/// meshlet of 64 vertices and 126 triangles was 378 records, each written by the compute stage and read by a vertex
+/// shader invocation of its own; it is 64 records and 378 indices. Records: a slot's count, then up to capacity *
+/// max_vertices vertex records, then capacity * max_primitives * corners indices, then the draw's arguments (index
+/// count, 1 instance, 0, 0, 0) and the vertex counter. A mesh workgroup takes its vertices and indices from the two
+/// counters; at most capacity of them write, so neither region overflows.
+bool FallbackIndexed(const MeshInfo& mesh) {
+    return mesh.primitive_lines.empty();
+}
+struct IndexedLayout {
+    u32 vertex_records, indices, index_word, args_word;
+};
+IndexedLayout FallbackIndexedLayout(const MeshInfo& mesh) {
+    const u32 words{FallbackRecordWords(mesh)};
+    IndexedLayout l;
+    l.vertex_records = MESH_FALLBACK_CAPACITY * mesh.max_vertices;
+    l.indices = MESH_FALLBACK_CAPACITY * mesh.max_primitives * mesh.Corners();
+    l.index_word = MESH_FALLBACK_CAPACITY + l.vertex_records * words;
+    l.args_word = l.index_word + l.indices;
+    return l;
+}
+
+void IndexedEpilogue(EmitContext& ctx, Id count) {
+    const MeshInfo& mesh{ctx.mesh_info};
+    const u32 corners{mesh.Corners()};
+    const u32 words{FallbackRecordWords(mesh)};
+    const IndexedLayout l{FallbackIndexedLayout(mesh)};
+    const Id device{ctx.Const(static_cast<u32>(spv::Scope::Device))};
+    const Id any{ctx.OpUGreaterThan(ctx.U1, count, ctx.u32_zero_value)};
+    If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
+        const Id index_count{BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(l.args_word))};
+        const Id vertex_count{BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(l.args_word + 5U))};
+        ctx.OpStore(ctx.mesh_fallback_base,
+                    ctx.OpAtomicIAdd(ctx.U32[1], index_count, device, ctx.u32_zero_value,
+                                     ctx.OpIMul(ctx.U32[1], count, ctx.Const(corners))));
+        ctx.OpStore(ctx.mesh_fallback_vbase,
+                    ctx.OpAtomicIAdd(ctx.U32[1], vertex_count, device, ctx.u32_zero_value,
+                                     ctx.OpSelect(ctx.U32[1], any, ctx.Const(mesh.max_vertices), ctx.u32_zero_value)));
+    });
+    Barrier(ctx);
+    const Id ibase{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_base)};
+    const Id vbase{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_vbase)};
+    const Id invocation{LocalInvocation(ctx)};
+    If(ctx, any, [&] {
+        Strided(ctx, mesh.max_vertices, ctx.mesh_threads, invocation, [&](Id vertex) {
+            const Id record{ctx.OpIAdd(ctx.U32[1], vbase, vertex)};
+            If(ctx, ctx.OpULessThan(ctx.U1, record, ctx.Const(l.vertex_records)), [&] {
+                const Id word{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                                         ctx.OpIMul(ctx.U32[1], record, ctx.Const(words)))};
+                ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index, word), ctx.Const(1U));
+                for (u32 line = 0; line < mesh.vertex_lines.size(); ++line) {
+                    const Id value{LineWord(ctx, ctx.mesh_attributes, vertex, 0,
+                                            static_cast<u32>(mesh.vertex_lines.size()), line)};
+                    ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                           ctx.OpIAdd(ctx.U32[1], word, ctx.Const(1U + line))),
+                                value);
+                }
+            });
+        });
+    });
+    Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
+        If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
+            for (u32 corner = 0; corner < corners; ++corner) {
+                const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
+                                         ctx.Const(4U + corner))};
+                // (an index byte the program left unwritten is held to the vertex count)
+                const Id vertex{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
+                                        mesh.max_vertices)};
+                const Id at{ctx.OpIAdd(ctx.U32[1], ibase,
+                                       ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
+                                                  ctx.Const(corner)))};
+                If(ctx, ctx.OpULessThan(ctx.U1, at, ctx.Const(l.indices)), [&] {
+                    ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                           ctx.OpIAdd(ctx.U32[1], ctx.Const(l.index_word), at)),
+                                ctx.OpIAdd(ctx.U32[1], vbase, vertex));
+                });
+            }
+        });
+    });
+}
+
 /// A mesh workgroup takes as many records as its primitives have corners, after the ones taken before it, and writes them.
 /// (The records were a fixed place for each slot, max_primitives * corners of them, and the draw covered every one: a
 /// meshlet of 40 triangles cost the vertex stage as much as one of 126, and so did a slot nothing ran in.)
@@ -214,6 +295,10 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
     }
     count = ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), count,
                          ctx.u32_zero_value);
+    if (FallbackIndexed(mesh)) {
+        IndexedEpilogue(ctx, count);
+        return;
+    }
     If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
         // (the draw's vertex count, after the records: the draw takes it from there, an indirect draw)
         const Id total{BufferWord(ctx, ctx.mesh_fallback_records_member_index,
@@ -436,8 +521,8 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
     const u32 words{FallbackRecordWords(mesh)};
     const u32 per_slot{mesh.max_primitives * corners};
-    // (one record a vertex, in the order the mesh workgroups took them)
-    const u32 most{MESH_FALLBACK_CAPACITY * per_slot};
+    // (one record a vertex, in the order the mesh workgroups took them; drawn indexed, the index is the record)
+    const u32 most{FallbackIndexed(mesh) ? FallbackIndexedLayout(mesh).vertex_records : MESH_FALLBACK_CAPACITY * per_slot};
     const Id vertex{ctx.OpLoad(ctx.U32[1], ctx.vertex_index)};
     const Id inside{ctx.OpULessThan(ctx.U1, vertex, ctx.Const(most))};
     const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),

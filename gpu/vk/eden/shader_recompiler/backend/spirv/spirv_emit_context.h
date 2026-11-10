@@ -400,6 +400,7 @@ public:
     Id mesh_map{};
     Id mesh_primitive_count{};
     Id mesh_fallback_base{};
+    Id mesh_fallback_vbase{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};

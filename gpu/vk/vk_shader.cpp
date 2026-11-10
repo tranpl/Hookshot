@@ -1029,6 +1029,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     put(o, p.fallback_record_words);
     put(o, p.fallback_payload_words);
     put(o, p.fallback_task_threads);
+    put(o, p.fallback_max_vertices);
     put(o, (uint64_t)p.stages.size());
     for (size_t k = 0; k < p.stages.size(); k++) {
         const Stage& st = p.stages[k];
@@ -1084,6 +1085,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         p->fallback_record_words = r.get<uint32_t>();
         p->fallback_payload_words = r.get<uint32_t>();
         p->fallback_task_threads = r.get<uint32_t>();
+        p->fallback_max_vertices = r.get<uint32_t>();
         const uint64_t n = r.count(1);
         bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
         for (uint64_t k = 0; ok && k < n; k++) {
@@ -1450,6 +1452,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             p.fallback_record_words = 1 + static_cast<u32>(mi.vertex_lines.size()) +
                                       static_cast<u32>(mi.primitive_lines.size());
             p.fallback_payload_words = mi.payload_words;
+            p.fallback_max_vertices = mi.primitive_lines.empty() ? mi.max_vertices : 0;
         }
         if (fsc) {
             Env fenv{s, *fsc, Shader::Stage::Fragment};

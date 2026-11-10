@@ -59,6 +59,9 @@ struct Program {
     uint32_t fallback_record_words = 1;             // (validity, then the vertex and primitive lines)
     uint32_t fallback_payload_words = 0;
     uint32_t fallback_task_threads = 1;             // (mesh workgroups one task workgroup may start)
+    // (the mesh program's vertices: an indexed draw, a record a vertex and an index a corner. 0: a record a corner, not indexed
+    // (a program with per-primitive outputs, which a shared vertex cannot carry))
+    uint32_t fallback_max_vertices = 0;
     std::vector<VkPipeline> fallback_compute;       // (per stage: the mesh program's dispatches)
     // What the translator was told about the bound textures (when it asked: most texture instructions carry their
     // type themselves), by stage and texture descriptor: the variant stands while the textures still answer the same
