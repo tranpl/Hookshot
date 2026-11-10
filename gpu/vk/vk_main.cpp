@@ -109,9 +109,12 @@ bool create_instance() {
             }
         }
     }
-    // (macos, MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0 tried: encoding on MoltenVK's own thread took half the graphics thread's time off
-    // it, but an event the other queue waits for then stopped advancing (0x100d6c8048 stuck while its waits went on), and near the
-    // Deku Tree every queue went on only after hold_ms: 2 fps. MoltenVK's default, synchronous submits, until that is understood)
+    // (macos) MoltenVK encodes a submission's Metal commands on its own thread (MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0), not on the
+    // replay thread inside vkQueueSubmit: in Hyrule Market that was 12-18 ms of the replay's 26-37 ms a frame, the frame's limit
+    // (15-30 fps). Same spot: 30 -> 37 fps, the replay 25.7 -> 9.5 ms, and the queues' event waits all met in order (none forced
+    // by the 50 ms hold, against 4). Tried on the first day of the port, when it was blamed for an event that stopped advancing
+    // near the Deku Tree (2 fps); that was among other faults since fixed, and has not been seen again. =1: synchronous
+    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
 #endif
     uint32_t version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&version);
