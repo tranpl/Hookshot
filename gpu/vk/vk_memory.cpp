@@ -2294,6 +2294,11 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
+        // (GPU results written in place are noted here too, as below: with the mirrors off (an integrated GPU, every Mac) no
+        // written binding was, so no CPU read of them waited for the GPU. OoT's exposure meter read short, the game opened the
+        // exposure up, and the scene stayed white for seconds at a time, until a slow frame put the read after the GPU's work)
+        if (written && size <= (1u << 20))
+            wb_pages_note(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo), mem_rec_value);
         return remember({p->buffer, off, size, 0});
     }
     // (a pool's mirror is made at its first binding, in this part's uploads: bound in guest memory until the next
