@@ -462,6 +462,21 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceFormatKHR fmt = formats[0];
     for (const auto& f : formats)   // (an UNORM target: the game's window textures are presented as they are)
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) fmt = f;
+    // (sRGB where the surface has it for an UNORM format: MoltenVK lists each format once a colour space, and the last one
+    // listed, taken above, need not be sRGB: the game's sRGB-encoded picture shown as another space's comes out washed)
+    for (const auto& f : formats)
+        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            fmt = f;
+            break;
+        }
+    {
+        char line[600];
+        int k = snprintf(line, sizeof line, "vk: surface formats:");
+        for (const auto& f : formats)
+            if (k < 560) k += snprintf(line + k, sizeof line - k, " %d/%d", (int)f.format, (int)f.colorSpace);
+        logf("%s; taken %d/%d", line, (int)fmt.format, (int)fmt.colorSpace);
+    }
     // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
     n = 0;
     result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
