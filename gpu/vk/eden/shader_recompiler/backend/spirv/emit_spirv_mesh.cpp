@@ -299,24 +299,32 @@ void TaskEpilogue(EmitContext& ctx) {
     if (ctx.mesh_fallback) {
         // (no OpEmitMeshTasksEXT: the mesh workgroups are a fixed dispatch; each thread that started one writes its
         // payload to that workgroup's slot, so the mesh dispatch reads it back)
-        const Id slot{ctx.OpIAdd(ctx.U32[1],
-                                 ctx.OpIMul(ctx.U32[1], WorkgroupId(ctx), ctx.Const(ctx.mesh_threads)),
-                                 LocalInvocation(ctx))};
         // (the count is how many meshlets this task workgroup started: the first that many threads, not all of them.
-        // Native launches one mesh workgroup a started meshlet; the fallback dispatches a fixed task_threads a workgroup
-        // and the rest stay culled.)
-        const Id started{ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count)};
-        If(ctx, ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
-            ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot),
-                        started);
-            If(ctx, started, [&] {
+        // Each takes the next free slot of the draw (a counter after the payloads, zero when the draw starts) and
+        // leaves its thread + 1 there: the mesh workgroup's index within its task. The slots were task workgroup *
+        // threads + thread: a draw of more than capacity / threads task workgroups lost every meshlet of the later
+        // ones, kept or not: with 32 threads and 1024 slots, all but the first 32 workgroups of the 70 to 160 the
+        // dungeon's and the forest's indirect draws run)
+        const Id invocation{LocalInvocation(ctx)};
+        const Id started{ctx.OpULessThan(ctx.U1, invocation, count)};
+        If(ctx, started, [&] {
+            const Id payload{PushU64(ctx, ctx.mesh_fallback_payload_member_index)};
+            const Id counter{BufferWordAt(
+                ctx, payload,
+                ctx.Const(MESH_FALLBACK_CAPACITY * (1U + ctx.mesh_info.payload_words)))};
+            const Id slot{ctx.OpAtomicIIncrement(
+                ctx.U32[1], counter, ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value)};
+            If(ctx, ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
+                ctx.OpStore(BufferWordAt(ctx, payload, slot),
+                            ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(1U)));
                 const Id first{ctx.OpIAdd(
                     ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
                     ctx.OpIMul(ctx.U32[1], slot, ctx.Const(ctx.mesh_info.payload_words)))};
-                const Id invocation{LocalInvocation(ctx)};
-                Strided(ctx, ctx.mesh_info.payload_words, ctx.mesh_threads, invocation, [&](Id index) {
-                    ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
-                                             ctx.OpIAdd(ctx.U32[1], first, index)),
+                // (the whole payload, not the words of this thread's column: the task keeps its meshlets' numbers in
+                // the words from 4 on, one a kept meshlet, and mesh workgroup j reads word 4 + j. With only words j and
+                // j + 32 in its slot it read 0: every mesh workgroup of a task program drew the draw's first meshlet)
+                Strided(ctx, ctx.mesh_info.payload_words, 1U, ctx.u32_zero_value, [&](Id index) {
+                    ctx.OpStore(BufferWordAt(ctx, payload, ctx.OpIAdd(ctx.U32[1], first, index)),
                                 ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index)));
                 });
             });
@@ -501,7 +509,18 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
     }
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     const Id word{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index))};
-    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value), workgroup,
+    // (the fallback, after a task: the dispatch's workgroup is the slot. A mesh shader's workgroup index counts within its
+    // own task's meshlets: the thread that started it, which the task left in the slot's word)
+    const u32 task_threads{ctx.mesh_fallback && ctx.runtime_info.mesh_fallback_task
+                               ? ctx.runtime_info.mesh_fallback_task_threads : 0U};
+    (void)task_threads;
+    Id mesh_index{workgroup};
+    if (ctx.mesh_fallback && ctx.runtime_info.mesh_fallback_task) {   // (the slot's word: the starting thread + 1, 0 not started)
+        const Id flag{ctx.OpLoad(ctx.U32[1], BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
+                                                          ctx.OpUMin(ctx.U32[1], workgroup, ctx.Const(MESH_FALLBACK_CAPACITY - 1U))))};
+        mesh_index = ctx.OpISub(ctx.U32[1], ctx.OpUMax(ctx.U32[1], flag, ctx.Const(1U)), ctx.Const(1U));
+    }
+    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value), mesh_index,
                         word);
 }
 

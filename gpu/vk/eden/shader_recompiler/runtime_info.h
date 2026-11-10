@@ -105,6 +105,8 @@ struct RuntimeInfo {
     bool mesh_fallback_vertex{};
     /// (hookshot) a mesh program with a task program before it: the task's count in its payload bounds the mesh workgroups
     bool mesh_fallback_task{};
+    /// (the task program's threads: a mesh workgroup's slot is its task workgroup * this + the thread that started it)
+    u32 mesh_fallback_task_threads{};
     /// (hookshot) the fallback's record slots: mesh workgroups past this one write nothing
     u32 mesh_fallback_capacity{};
 

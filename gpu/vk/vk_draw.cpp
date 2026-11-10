@@ -4469,7 +4469,7 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
     f.records_address = fallback_buffer_address(f.records);
     if (p.fallback_task) {
-        const uint64_t payload = capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4;
+        const uint64_t payload = capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4 + 16;   // (+ the slot counter)
         if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return false;
         f.payload_address = fallback_buffer_address(f.payload);
     }
@@ -4522,6 +4522,21 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         if (told++ < 2) logf("vk: fallback: a mesh draw with a count buffer is left out (issue 640)");
         return false;
     }
+    {   // (RX_VK_LOG_FALLBACK=1: what the fallback's mesh draws ask for, once for each shape of draw, 200 at most)
+        static const bool log_fb = getenv("RX_VK_LOG_FALLBACK") != nullptr;
+        if (log_fb) {
+            static std::mutex mu;
+            static std::unordered_set<uint64_t> seen;
+            uint32_t w[8]{};
+            if (d.indirect) host->gpu_read(d.indirect, w, sizeof w);
+            const uint64_t key = mix(mix(p.key, (uint64_t)d.max << 32 | (uint32_t)d.groups[0]), (uint64_t)(d.indirect != 0) << 40 | (uint64_t)d.stride << 32 | (w[0] >> 3));
+            std::lock_guard lk(mu);
+            if (seen.size() < 200 && seen.insert(key).second)
+                logf("vk: fallback draw %016llx: task %d threads %u, groups %d first %d, indirect %d max %d stride %d, record words %u %u %u %u | %u %u %u %u; per slot %u vertices",
+                     (unsigned long long)p.key, (int)p.fallback_task, p.fallback_task_threads, d.groups[0], (int)d.first_task, d.indirect ? 1 : 0, d.max, d.stride,
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], p.fallback_vertices_per_workgroup);
+        }
+    }
     FallbackBuffers* f = nullptr;
     if (!fallback_buffers_of(p, f) || !fallback_compute_pipelines(p)) return false;
     fallback_payload_address = f->payload_address;
@@ -4543,9 +4558,12 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (a task workgroup's slots are wg * threads + thread: those past the buffer are not started)
+    // (an indirect draw's count is only on the GPU (the draw's own is 0): every slot, as the draws with no task. With 0
+    // slots no indirect draw of a task program drew anything)
     const uint32_t slots{p.fallback_task
-                             ? (uint32_t)std::min<uint64_t>(
-                                   (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity)
+                             ? (indirect ? capacity
+                                         : (uint32_t)std::min<uint64_t>(
+                                               (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity))
                              : 0};
     auto send = [&](size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
@@ -4561,9 +4579,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
             }
             vkCmdDispatchIndirect(cmd, mesh_conv_buf, mesh_conv_off);
         } else {
-            const uint32_t most{p.fallback_task ? (uint32_t)std::max(1u, capacity / std::max(1u, p.fallback_task_threads))
-                                                : groups};
-            const uint32_t n{mesh_stage ? groups : std::min(groups, most)};
+            const uint32_t n{groups};   // (every task workgroup: the meshlets they keep take the slots in turn)
             if (!n) return true;
             vkCmdDispatch(cmd, n, 1, 1);
         }
