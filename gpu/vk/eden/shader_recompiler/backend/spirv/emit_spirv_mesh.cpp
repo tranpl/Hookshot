@@ -211,6 +211,12 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
         }
         If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
             ctx.OpStore(BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot), count);
+            // (the draw's vertex count, after the records: each mesh workgroup that ran adds its corners, and the draw
+            // takes it from there (an indirect draw). It was the whole buffer's, 1024 slots, whatever ran)
+            const Id total{BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                      ctx.Const(MESH_FALLBACK_CAPACITY * (1U + per_slot * words)))};
+            ctx.OpAtomicIAdd(ctx.U32[1], total, ctx.Const(static_cast<u32>(spv::Scope::Device)),
+                             ctx.u32_zero_value, ctx.Const(per_slot));
         });
         const Id invocation{LocalInvocation(ctx)};
         Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {

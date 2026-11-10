@@ -6,6 +6,7 @@
 // and the draws themselves.
 //
 // Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
+#include <condition_variable>
 #include <algorithm>
 #include <filesystem>
 #include <atomic>
@@ -4443,6 +4444,8 @@ struct FallbackBuffers {
 };
 thread_local std::unordered_map<const Program*, FallbackBuffers> fallback_buffers;
 thread_local uint32_t fallback_vertex_count = 0;
+thread_local VkBuffer fallback_draw_buffer = VK_NULL_HANDLE;   // (the draw's arguments, which the mesh workgroups fill)
+thread_local VkDeviceSize fallback_draw_offset = 0;
 
 uint64_t fallback_buffer_address(VkBuffer buffer) {
     VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -4460,12 +4463,13 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     f.tried = true;
     const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     if (!p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
+    // (+ the draw's arguments after the records: the vertex count the mesh workgroups add up, 1 instance, 0, 0)
     const uint64_t records = capacity * 4 +
-                             capacity * (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words * 4;
+                             capacity * (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words * 4 + 16;
     if (records > (512ull << 20)) return false;
     void* mapped = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
     f.records_address = fallback_buffer_address(f.records);
     if (p.fallback_task) {
@@ -4480,13 +4484,28 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
 }
 
 bool fallback_compute_pipelines(Program& p) {
+    // (one program's at a time, several programs' at once: the start's precompile builds them on every thread. Under one
+    // lock for the whole build they went one after another)
     static std::mutex mu;
-    std::lock_guard lk(mu);
-    if (!p.fallback_compute.empty()) return true;
+    static std::condition_variable cv;
+    static std::unordered_set<const Program*> building;
     // (a program whose compute pipeline the driver refused stays refused: tried again at every draw, MoltenVK converted and
     // compiled the same shader thousands of times a minute in Kokiri Forest, 0.3 fps; its draws are left out instead)
     static std::unordered_set<uint64_t> refused;
-    if (refused.count(p.key)) return false;
+    {
+        std::unique_lock lk(mu);
+        cv.wait(lk, [&] { return !building.count(&p); });
+        if (!p.fallback_compute.empty()) return true;
+        if (refused.count(p.key)) return false;
+        building.insert(&p);
+    }
+    struct Done {
+        const Program* p;
+        ~Done() {
+            { std::lock_guard lk(mu); building.erase(p); }
+            cv.notify_all();
+        }
+    } done{&p};
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -4505,12 +4524,14 @@ bool fallback_compute_pipelines(Program& p) {
             static std::atomic<int> told{0};
             if (told++ < 8) logf("vk: fallback: the compute pipeline of %016llx could not be made: its draws are left out", (unsigned long long)p.key);
             for (VkPipeline pl : made) if (pl) vkDestroyPipeline(dev.device, pl, nullptr);
+            std::lock_guard lk(mu);
             refused.insert(p.key);
             return false;
         }
         pcache_built_since_save++;
     }
     if (!any) return false;
+    std::lock_guard lk(mu);
     p.fallback_compute = std::move(made);
     return true;
 }
@@ -4544,8 +4565,18 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     end_pass(cmd);
     vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
-    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
-    if (f->payload) vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
+    // (the draw's arguments: 0 vertices until the mesh workgroups add theirs, 1 instance)
+    const VkDeviceSize draw_args = (VkDeviceSize)capacity * 4 * (1 + (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words);
+    vkCmdFillBuffer(cmd, f->records, draw_args, 16, 0);
+    vkCmdFillBuffer(cmd, f->records, draw_args + 4, 4, 1);
+    fallback_draw_buffer = f->records, fallback_draw_offset = draw_args;
+    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words. After them the
+    // task's slot counter, which is the mesh dispatch's count: (slots taken, 1, 1))
+    const VkDeviceSize mesh_args = (VkDeviceSize)capacity * 4 * (1 + (uint64_t)p.fallback_payload_words);
+    if (f->payload) {
+        vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, f->payload, mesh_args + 4, 8, 1);
+    }
     full_barrier(cmd);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr);
@@ -4570,7 +4601,9 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
         if (mesh_stage && p.fallback_task) {
             if (!slots) return true;
-            vkCmdDispatch(cmd, slots, 1, 1);   // (one workgroup a slot; the task's flags cull those it did not start)
+            // (one workgroup a slot the task's threads took, as their counter says: every slot of the buffer was run, 1024
+            // mesh workgroups a draw for the few dozen meshlets kept)
+            vkCmdDispatchIndirect(cmd, f->payload, mesh_args);
         } else if (d.indirect) {
             if (!indirect) {
                 static std::atomic<int> told{0};
@@ -4990,7 +5023,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (d.mesh) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
-            if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);
+            if (fallback_vertex_count && fallback_draw_buffer) vkCmdDrawIndirect(cmd, fallback_draw_buffer, fallback_draw_offset, 1, 16);
             st_mesh++;
             st_draws++, pass.draws++;
             return;
@@ -5763,24 +5796,29 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         fclose(f);
     }
     std::vector<Program*> computes;
+    // (the mesh fallback's programs too: their task and mesh stages are compute pipelines, which were built at each one's first
+    // draw, on the recording thread: seconds of Metal's compiler each, a hard stop in the middle of play)
+    std::vector<Program*> fallbacks;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
         if (p.compute) computes.push_back(&p);
+        else if (p.fallback) fallbacks.push_back(&p);
     });
-    const size_t total = notes.size() + computes.size();
+    const size_t total = notes.size() + computes.size() + fallbacks.size();
     // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
     // 99%", Discord 11-08) goes on to the game after PRE_STALL_S seconds with no progress, the stragglers left running; it is
     // let go then, never freed. RX_VK_PRECOMPILE_STALL_S=<s>, 0: wait for all, as before)
     struct Pre {
         std::vector<std::unique_ptr<PipeNote>> notes;
-        std::vector<Program*> computes;
+        std::vector<Program*> computes, fallbacks;
         std::atomic<size_t> next{0}, done{0};
         std::mutex mu;
         bool abandoned = false;
     };
     const size_t graphics_n = notes.size(), computes_n = computes.size();
     Pre* pre = new Pre;
-    pre->notes = std::move(notes), pre->computes = std::move(computes);
+    const size_t fallbacks_n = fallbacks.size();
+    pre->notes = std::move(notes), pre->computes = std::move(computes), pre->fallbacks = std::move(fallbacks);
     auto& next = pre->next;
     auto& done = pre->done;
     const auto worker = [pre, total] {
@@ -5803,6 +5841,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 std::lock_guard lk(pre->mu);
                 if (!pre->abandoned) p.compute_pipeline = made;
                 else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
+            } else if (i >= computes.size() + notes.size()) {
+                fallback_compute_pipelines(*pre->fallbacks[i - computes.size() - notes.size()]);
             } else {
                 PipeNote& n = *notes[i - computes.size()];
                 const Program* p = program_find(n.prog, n.variant);
@@ -5855,7 +5895,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         for (std::thread& t : threads) t.join();
         delete pre;
     }
-    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, graphics_n, computes_n,
+    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines, %zu mesh fallback programs in %.0f ms", programs_n, graphics_n, computes_n,
+         fallbacks_n,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
