@@ -14,15 +14,34 @@ layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
 layout(binding = 2, r11f_g11f_b10f) uniform image2D hist;
 layout(push_constant) uniform P { ivec2 size; int valid; } pc;
+// pc.valid bit 0: the bound above. Bit 1: the picture before is blended in (vk_draw.cpp, on unless RX_VK_TAAU_NO_ACCUM).
+// The game moves its projection by a part of a pixel each frame for the network to gather detail over frames; with each
+// frame shown as it is, fine texture and foliage shimmer even with the camera still. The stand-in has no motion vectors,
+// so the picture before is taken at the same pixel and held to what this frame has around it (the smallest and largest
+// of the 3 x 3 input texels, in the input's square-root encoding): still parts settle, moving ones follow at once.
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
     const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
     // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
     // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
-    const vec3 s = textureLod(src, uv, 0.0).rgb;
+    vec3 s = textureLod(src, uv, 0.0).rgb;
+    const bool bad = any(isnan(s)) || any(isinf(s));
+    if ((pc.valid & 2) != 0) {
+        const vec2 texel = 1.0 / vec2(textureSize(src, 0));
+        vec3 lo = s, hi = s;
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                if (x == 0 && y == 0) continue;
+                const vec3 n = textureLod(src, uv + vec2(x, y) * texel, 0.0).rgb;
+                lo = min(lo, n), hi = max(hi, n);
+            }
+        const vec3 p = sqrt(max(imageLoad(hist, g).rgb, vec3(0.0)));
+        if (bad) s = p;
+        else if (!(any(isnan(p)) || any(isinf(p)))) s = mix(clamp(p, lo, hi), s, 0.12);
+    }
     vec3 c = s * s;
-    if (pc.valid != 0) {
+    if ((pc.valid & 1) != 0) {
         const vec3 p = imageLoad(hist, g).rgb;
         c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
         c = clamp(c, p * 0.6, p * 1.5 + 0.01);

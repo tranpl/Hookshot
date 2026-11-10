@@ -5572,7 +5572,10 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     }
     // (bounded when the history is last frame's or so: a pause of the TAAU, a menu, starts again unbounded)
     const uint64_t now_frame = texture_frame_no();
-    size[2] = temporal && !no_clamp && hist_frame && now_frame - hist_frame <= 3 ? 1u : 0u;
+    // (RX_VK_TAAU_NO_ACCUM=1: each frame as it is, as before: no blend with the picture before)
+    static const bool no_accum = getenv("RX_VK_TAAU_NO_ACCUM") != nullptr;
+    const bool recent = temporal && hist_frame && now_frame - hist_frame <= 3;
+    size[2] = (recent && !no_clamp ? 1u : 0u) | (recent && !no_accum ? 2u : 0u);
     hist_frame = now_frame;
     const VkDescriptorImageInfo in_info{linear, input_view, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo out_info{VK_NULL_HANDLE, output_view, VK_IMAGE_LAYOUT_GENERAL};
